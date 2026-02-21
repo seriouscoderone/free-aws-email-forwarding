@@ -10,7 +10,7 @@ Costs essentially nothing on AWS free tier. No servers to manage.
 - Stores raw emails in S3 (90-day retention)
 - Forwards to your personal email (Gmail, etc.)
 - Rewrites headers so replies go to the original sender
-- Optionally creates SMTP credentials so you can **send** from your domain via Gmail
+- Optionally creates ready-to-use SMTP credentials so you can **send** from your domain via Gmail
 
 ## Prerequisites
 
@@ -55,7 +55,8 @@ Edit `config.json`:
     { "from": "hello@yourdomain.com", "to": "you@gmail.com" },
     { "from": "support@yourdomain.com", "to": "team@company.com" }
   ],
-  "enableSmtpSending": true
+  "enableSmtpSending": true,
+  "existingTxtValues": []
 }
 ```
 
@@ -65,9 +66,12 @@ Edit `config.json`:
 | `hostedZoneId` | Yes | Route53 hosted zone ID for the domain |
 | `region` | No | AWS region (default: `us-east-1`). Must support SES receiving. |
 | `rules` | Yes | Array of forwarding rules |
-| `enableSmtpSending` | No | Create IAM SMTP credentials for sending (default: `false`) |
+| `enableSmtpSending` | No | Create SMTP credentials for sending (default: `false`) |
+| `existingTxtValues` | No | Existing TXT record values at the domain apex to preserve (e.g. `["google-site-verification=abc123"]`) |
 
 **SES receiving regions:** SES inbound email is only available in `us-east-1`, `us-west-2`, and `eu-west-1`.
+
+**Existing TXT records:** Route53 only allows one TXT record set per name. If your domain already has TXT records (like Google site verification), add them to `existingTxtValues` so they're preserved when the stack creates the SPF record. You'll need to delete the existing TXT record before the first deploy so CDK can manage it.
 
 ## Activating the Rule Set
 
@@ -89,34 +93,26 @@ This lets you send email **from** your custom domain using Gmail's interface.
 
 ### 1. Enable SMTP credentials
 
-Set `"enableSmtpSending": true` in `config.json` and deploy.
+Set `"enableSmtpSending": true` in `config.json` and deploy. The stack automatically creates an IAM user, converts the credentials to an SES SMTP password, and stores everything ready-to-use in Secrets Manager.
 
 ### 2. Get SMTP credentials
 
 ```bash
-# Retrieve from Secrets Manager
 aws secretsmanager get-secret-value \
   --secret-id EmailForwarding/smtp-credentials \
-  --query SecretString --output text
+  --query SecretString --output text | jq .
 ```
 
-This gives you an `accessKeyId` and `secretAccessKey`.
+This gives you `smtpEndpoint`, `smtpPort`, `smtpUsername`, and `smtpPassword` — all ready to use directly.
 
-### 3. Convert to SMTP password
-
-```bash
-# The secretAccessKey is NOT the SMTP password — it must be converted
-python3 scripts/smtp-password.py <secretAccessKey> us-east-1
-```
-
-### 4. Configure Gmail
+### 3. Configure Gmail
 
 1. Gmail Settings > Accounts and Import > "Send mail as" > "Add another email address"
 2. Enter your name and `you@yourdomain.com`, uncheck "Treat as an alias"
-3. SMTP server: `email-smtp.us-east-1.amazonaws.com`
-4. Port: `587`
-5. Username: the `accessKeyId` from step 2
-6. Password: the SMTP password from step 3
+3. SMTP server: `smtpEndpoint` from step 2
+4. Port: `smtpPort` from step 2
+5. Username: `smtpUsername` from step 2
+6. Password: `smtpPassword` from step 2
 7. Select "Secured connection using TLS"
 8. Gmail will send a verification email — check your forwarded inbox
 
@@ -140,7 +136,8 @@ Outgoing email (Gmail "Send mail as")
 - **S3 bucket** for raw email storage (90-day lifecycle)
 - **Lambda function** for email forwarding
 - **SES Receipt Rule Set** with forwarding rules
-- **IAM User + SMTP credentials** (optional, for sending)
+- **IAM User + SMTP credentials** in Secrets Manager (optional, for sending)
+- **Custom resource** that converts IAM key → SES SMTP password automatically
 
 ## Costs
 

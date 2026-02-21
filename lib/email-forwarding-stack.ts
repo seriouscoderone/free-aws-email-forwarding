@@ -5,7 +5,7 @@ import * as s3 from 'aws-cdk-lib/aws-s3';
 import * as route53 from 'aws-cdk-lib/aws-route53';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as lambda from 'aws-cdk-lib/aws-lambda-nodejs';
-import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
+import * as cr from 'aws-cdk-lib/custom-resources';
 import { Construct } from 'constructs';
 import * as path from 'path';
 
@@ -166,28 +166,60 @@ export class EmailForwardingStack extends cdk.Stack {
         user: smtpUser,
       });
 
-      new secretsmanager.Secret(this, 'SmtpCredentials', {
-        secretName: `${id}/smtp-credentials`,
-        secretObjectValue: {
-          accessKeyId: cdk.SecretValue.unsafePlainText(accessKey.accessKeyId),
-          secretAccessKey: accessKey.secretAccessKey,
+      // Custom resource Lambda that converts IAM secret key → SMTP password
+      // and stores ready-to-use credentials in Secrets Manager
+      const secretName = `${id}/smtp-credentials`;
+      const smtpEndpoint = `email-smtp.${region}.amazonaws.com`;
+      const smtpPort = '587';
+
+      const smtpCredsHandler = new lambda.NodejsFunction(this, 'SmtpCredsHandler', {
+        entry: path.join(__dirname, '..', 'lambda', 'smtp-credentials.ts'),
+        handler: 'handler',
+        runtime: cdk.aws_lambda.Runtime.NODEJS_20_X,
+        timeout: cdk.Duration.seconds(30),
+        bundling: { minify: true, sourceMap: true, target: 'node20' },
+      });
+
+      smtpCredsHandler.addToRolePolicy(new iam.PolicyStatement({
+        actions: [
+          'secretsmanager:CreateSecret',
+          'secretsmanager:PutSecretValue',
+          'secretsmanager:DeleteSecret',
+        ],
+        resources: [
+          `arn:aws:secretsmanager:${region}:${cdk.Stack.of(this).account}:secret:${secretName}-*`,
+        ],
+      }));
+
+      const smtpCredsProvider = new cr.Provider(this, 'SmtpCredsProvider', {
+        onEventHandler: smtpCredsHandler,
+      });
+
+      new cdk.CustomResource(this, 'SmtpCredentials', {
+        serviceToken: smtpCredsProvider.serviceToken,
+        properties: {
+          SecretName: secretName,
+          AccessKeyId: accessKey.accessKeyId,
+          SecretAccessKey: accessKey.secretAccessKey.unsafeUnwrap(),
+          Region: region,
+          SmtpEndpoint: smtpEndpoint,
+          SmtpPort: smtpPort,
         },
-        description: `SMTP credentials for ${domain} email sending. Use scripts/smtp-password.py to convert the secret access key to an SMTP password.`,
       });
 
       new cdk.CfnOutput(this, 'SmtpEndpoint', {
-        value: `email-smtp.${region}.amazonaws.com`,
+        value: smtpEndpoint,
         description: 'SMTP server endpoint',
       });
 
       new cdk.CfnOutput(this, 'SmtpPort', {
-        value: '587',
+        value: smtpPort,
         description: 'SMTP TLS port',
       });
 
       new cdk.CfnOutput(this, 'SmtpCredentialsSecret', {
-        value: `${id}/smtp-credentials`,
-        description: 'Secrets Manager secret name containing SMTP credentials',
+        value: secretName,
+        description: 'Secrets Manager secret with ready-to-use SMTP username and password',
       });
     }
 
