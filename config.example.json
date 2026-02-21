@@ -1,0 +1,9 @@
+{
+  "domain": "example.com",
+  "hostedZoneId": "Z0123456789ABCDEF",
+  "region": "us-east-1",
+  "rules": [
+    { "from": "hello@example.com", "to": "me@gmail.com" }
+  ],
+  "enableSmtpSending": true
+}

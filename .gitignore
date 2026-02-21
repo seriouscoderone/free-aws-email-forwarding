@@ -1,0 +1,11 @@
+node_modules/
+cdk.out/
+*.js
+*.d.ts
+*.js.map
+
+# User-specific config (contains real domain/zone info)
+config.json
+
+# CDK asset staging
+.cdk.staging/
