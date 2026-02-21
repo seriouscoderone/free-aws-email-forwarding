@@ -114,7 +114,9 @@ This gives you `smtpEndpoint`, `smtpPort`, `smtpUsername`, and `smtpPassword` �
 5. Username: `smtpUsername` from step 2
 6. Password: `smtpPassword` from step 2
 7. Select "Secured connection using TLS"
-8. Gmail will send a verification email — check your forwarded inbox
+8. Click "Add Account" — Gmail will send a confirmation email to `you@yourdomain.com`
+9. That confirmation arrives via this stack's forwarding, so **make sure forwarding is working first**
+10. Click the confirmation link in the forwarded email to finish setup
 
 ## Architecture
 
