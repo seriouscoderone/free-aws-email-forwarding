@@ -28,4 +28,5 @@ new EmailForwardingStack(app, 'EmailForwarding', {
   hostedZoneId: config.hostedZoneId,
   rules: config.rules,
   enableSmtpSending: config.enableSmtpSending ?? false,
+  existingTxtValues: config.existingTxtValues,
 });

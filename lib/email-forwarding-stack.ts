@@ -19,13 +19,15 @@ export interface EmailForwardingStackProps extends cdk.StackProps {
   hostedZoneId: string;
   rules: ForwardingRule[];
   enableSmtpSending?: boolean;
+  /** Existing TXT record values at the domain apex to preserve (e.g. google-site-verification) */
+  existingTxtValues?: string[];
 }
 
 export class EmailForwardingStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props: EmailForwardingStackProps) {
     super(scope, id, props);
 
-    const { domain, hostedZoneId, rules, enableSmtpSending } = props;
+    const { domain, hostedZoneId, rules, enableSmtpSending, existingTxtValues } = props;
 
     // --- Hosted Zone ---
     const hostedZone = route53.HostedZone.fromHostedZoneAttributes(this, 'HostedZone', {
@@ -46,9 +48,20 @@ export class EmailForwardingStack extends cdk.Stack {
       values: [{ priority: 10, hostName: `inbound-smtp.${region}.amazonaws.com` }],
     });
 
-    new route53.TxtRecord(this, 'SpfRecord', {
-      zone: hostedZone,
-      values: ['v=spf1 include:amazonses.com ~all'],
+    // Use CfnRecordSet for the apex TXT record so we can merge SPF with
+    // any existing TXT values (e.g. google-site-verification). Route53
+    // only allows one TXT record set per name.
+    const txtValues = [
+      '"v=spf1 include:amazonses.com ~all"',
+      ...(existingTxtValues || []).map(v => `"${v}"`),
+    ];
+
+    new route53.CfnRecordSet(this, 'SpfRecord', {
+      hostedZoneId,
+      name: `${domain}.`,
+      type: 'TXT',
+      ttl: '1800',
+      resourceRecords: txtValues,
     });
 
     new route53.TxtRecord(this, 'DmarcRecord', {
