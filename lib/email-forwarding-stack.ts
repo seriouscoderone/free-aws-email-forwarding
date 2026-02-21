@@ -204,6 +204,7 @@ export class EmailForwardingStack extends cdk.Stack {
           Region: region,
           SmtpEndpoint: smtpEndpoint,
           SmtpPort: smtpPort,
+          Version: '2', // Bump to force recompute
         },
       });
 

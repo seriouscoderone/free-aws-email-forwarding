@@ -10,19 +10,17 @@ import {
 const sm = new SecretsManagerClient({});
 
 // Per AWS documentation: https://docs.aws.amazon.com/ses/latest/dg/smtp-credentials.html
-const SMTP_SIGNING_VERSION = Buffer.from([0x04]);
+const VERSION = Buffer.from([0x04]);
+const MESSAGE = 'SendRawEmail';
 
 function calculateSmtpPassword(secretKey: string, region: string): string {
-  const date = '11111111'; // Static per AWS algorithm
-  const service = 'ses';
-
-  const kDate = createHmac('sha256', `AWS4${secretKey}`).update(date).digest();
+  const kDate = createHmac('sha256', `AWS4${secretKey}`).update('11111111').digest();
   const kRegion = createHmac('sha256', kDate).update(region).digest();
-  const kService = createHmac('sha256', kRegion).update(service).digest();
+  const kService = createHmac('sha256', kRegion).update('ses').digest();
   const kTerminal = createHmac('sha256', kService).update('aws4_request').digest();
-  const signature = createHmac('sha256', kTerminal).update(SMTP_SIGNING_VERSION).digest();
+  const kMessage = createHmac('sha256', kTerminal).update(MESSAGE).digest();
 
-  return Buffer.concat([SMTP_SIGNING_VERSION, signature]).toString('base64');
+  return Buffer.concat([VERSION, kMessage]).toString('base64');
 }
 
 interface Event {
