@@ -52,7 +52,7 @@ export class EmailForwardingStack extends cdk.Stack {
     // any existing TXT values (e.g. google-site-verification). Route53
     // only allows one TXT record set per name.
     const txtValues = [
-      '"v=spf1 include:amazonses.com ~all"',
+      '"v=spf1 include:amazonses.com -all"',
       ...(existingTxtValues || []).map(v => `"${v}"`),
     ];
 
@@ -67,7 +67,7 @@ export class EmailForwardingStack extends cdk.Stack {
     new route53.TxtRecord(this, 'DmarcRecord', {
       zone: hostedZone,
       recordName: `_dmarc.${domain}`,
-      values: [`v=DMARC1; p=none; rua=mailto:${rules[0].from}`],
+      values: [`v=DMARC1; p=reject; rua=mailto:${rules[0].from}`],
     });
 
     // --- S3 Bucket for raw emails ---
