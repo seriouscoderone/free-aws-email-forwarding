@@ -89,34 +89,47 @@ If you have existing SES receipt rules (e.g., for another domain), add all forwa
 
 ## Gmail "Send mail as" Setup
 
-This lets you send email **from** your custom domain using Gmail's interface.
+This lets each forwarded address send email **from** your custom domain using Gmail's interface. **Each rule gets its own IAM user and SMTP credentials**, scoped via an `ses:FromAddress` condition so the credentials for `alice@yourdomain.com` cannot be used to send as `bob@yourdomain.com`.
 
 ### 1. Enable SMTP credentials
 
-Set `"enableSmtpSending": true` in `config.json` and deploy. The stack automatically creates an IAM user, converts the credentials to an SES SMTP password, and stores everything ready-to-use in Secrets Manager.
+Set `"enableSmtpSending": true` in `config.json` and deploy. The stack creates **one IAM user, one access key, and one Secrets Manager entry per rule**, with the password pre-converted to SES SMTP format.
 
-### 2. Get SMTP credentials
+### 2. Get SMTP credentials for a specific address
+
+Each rule's secret is named `EmailForwarding/smtp/<sanitized-from-address>`. The sanitizer lower-cases and replaces non-alphanumerics with `-`:
+
+| `from` in config.json | Secret name |
+|---|---|
+| `alice@example.com` | `EmailForwarding/smtp/alice-example-com` |
+| `Bob.Jones@example.com` | `EmailForwarding/smtp/bob-jones-example-com` |
 
 ```bash
 aws secretsmanager get-secret-value \
-  --secret-id EmailForwarding/smtp-credentials \
+  --secret-id EmailForwarding/smtp/alice-example-com \
   --query SecretString --output text | jq .
 ```
 
 This gives you `smtpEndpoint`, `smtpPort`, `smtpUsername`, and `smtpPassword` — all ready to use directly.
 
+You can also find every per-rule secret name in the stack's CloudFormation outputs (`SmtpSecret<sanitized>`).
+
 ### 3. Configure Gmail
 
+For each address you want to send from:
+
 1. Gmail Settings > Accounts and Import > "Send mail as" > "Add another email address"
-2. Enter your name and `you@yourdomain.com`, uncheck "Treat as an alias"
-3. SMTP server: `smtpEndpoint` from step 2
-4. Port: `smtpPort` from step 2
-5. Username: `smtpUsername` from step 2
-6. Password: `smtpPassword` from step 2
+2. Enter the display name and `you@yourdomain.com`, uncheck "Treat as an alias"
+3. SMTP server: `smtpEndpoint` from the secret
+4. Port: `smtpPort` from the secret
+5. Username: `smtpUsername` from the secret
+6. Password: `smtpPassword` from the secret
 7. Select "Secured connection using TLS"
 8. Click "Add Account" — Gmail will send a confirmation email to `you@yourdomain.com`
 9. That confirmation arrives via this stack's forwarding, so **make sure forwarding is working first**
 10. Click the confirmation link in the forwarded email to finish setup
+
+> **Note on upgrading from a pre-per-rule deploy:** earlier versions of this stack created a single shared IAM user and a single secret named `EmailForwarding/smtp-credentials`. After upgrading and redeploying, that shared resource will be deleted and replaced with per-rule equivalents — any Gmail "Send mail as" entries configured against the old credentials will need to be re-added with the new ones.
 
 ## Architecture
 
@@ -138,8 +151,8 @@ Outgoing email (Gmail "Send mail as")
 - **S3 bucket** for raw email storage (90-day lifecycle)
 - **Lambda function** for email forwarding
 - **SES Receipt Rule Set** with forwarding rules
-- **IAM User + SMTP credentials** in Secrets Manager (optional, for sending)
-- **Custom resource** that converts IAM key → SES SMTP password automatically
+- **Per-rule IAM User + SMTP credentials** in Secrets Manager (optional, for sending). Each rule gets its own credentials, scoped to only send as its own `from` address.
+- **Custom resource** that converts IAM keys → SES SMTP passwords automatically
 
 ## Costs
 

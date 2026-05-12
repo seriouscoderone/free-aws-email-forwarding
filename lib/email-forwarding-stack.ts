@@ -23,6 +23,13 @@ export interface EmailForwardingStackProps extends cdk.StackProps {
   existingTxtValues?: string[];
 }
 
+// Convert an email address into a string safe to embed in IAM user names,
+// Secrets Manager secret names, and CDK construct IDs.
+// e.g. "alice.smith@example.com" -> "alice-smith-example-com"
+function sanitizeForResourceName(addr: string): string {
+  return addr.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+}
+
 export class EmailForwardingStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props: EmailForwardingStackProps) {
     super(scope, id, props);
@@ -146,32 +153,16 @@ export class EmailForwardingStack extends cdk.Stack {
     });
 
     // --- SMTP Sending Credentials (conditional) ---
+    // One IAM user, access key, and Secrets Manager entry per rule.
+    // Each user is scoped via an IAM `ses:FromAddress` condition so they
+    // can only send mail with their own address in the From header — even
+    // though the underlying SES identity (the domain) covers all addresses.
     if (enableSmtpSending) {
-      const smtpUser = new iam.User(this, 'SmtpUser', {
-        userName: `${id}-smtp-user`,
-      });
-
-      // Scope to configured from addresses
-      const fromArns = rules.map(r =>
-        `arn:aws:ses:${region}:${cdk.Stack.of(this).account}:identity/${r.from}`
-      );
       const domainArn = `arn:aws:ses:${region}:${cdk.Stack.of(this).account}:identity/${domain}`;
-
-      smtpUser.addToPolicy(new iam.PolicyStatement({
-        actions: ['ses:SendRawEmail'],
-        resources: [...fromArns, domainArn],
-      }));
-
-      const accessKey = new iam.AccessKey(this, 'SmtpAccessKey', {
-        user: smtpUser,
-      });
-
-      // Custom resource Lambda that converts IAM secret key → SMTP password
-      // and stores ready-to-use credentials in Secrets Manager
-      const secretName = `${id}/smtp-credentials`;
       const smtpEndpoint = `email-smtp.${region}.amazonaws.com`;
       const smtpPort = '587';
 
+      // Single custom-resource handler, invoked once per rule with different SecretName.
       const smtpCredsHandler = new lambda.NodejsFunction(this, 'SmtpCredsHandler', {
         entry: path.join(__dirname, '..', 'lambda', 'smtp-credentials.ts'),
         handler: 'handler',
@@ -187,7 +178,7 @@ export class EmailForwardingStack extends cdk.Stack {
           'secretsmanager:DeleteSecret',
         ],
         resources: [
-          `arn:aws:secretsmanager:${region}:${cdk.Stack.of(this).account}:secret:${secretName}-*`,
+          `arn:aws:secretsmanager:${region}:${cdk.Stack.of(this).account}:secret:${id}/smtp/*`,
         ],
       }));
 
@@ -195,32 +186,54 @@ export class EmailForwardingStack extends cdk.Stack {
         onEventHandler: smtpCredsHandler,
       });
 
-      new cdk.CustomResource(this, 'SmtpCredentials', {
-        serviceToken: smtpCredsProvider.serviceToken,
-        properties: {
-          SecretName: secretName,
-          AccessKeyId: accessKey.accessKeyId,
-          SecretAccessKey: accessKey.secretAccessKey.unsafeUnwrap(),
-          Region: region,
-          SmtpEndpoint: smtpEndpoint,
-          SmtpPort: smtpPort,
-          Version: '2', // Bump to force recompute
-        },
-      });
+      for (const rule of rules) {
+        const safe = sanitizeForResourceName(rule.from);
+
+        const smtpUser = new iam.User(this, `SmtpUser-${safe}`, {
+          userName: `${id}-smtp-${safe}`,
+        });
+
+        smtpUser.addToPolicy(new iam.PolicyStatement({
+          actions: ['ses:SendRawEmail'],
+          resources: [domainArn],
+          conditions: {
+            StringEquals: { 'ses:FromAddress': rule.from },
+          },
+        }));
+
+        const accessKey = new iam.AccessKey(this, `SmtpAccessKey-${safe}`, {
+          user: smtpUser,
+        });
+
+        const secretName = `${id}/smtp/${safe}`;
+
+        new cdk.CustomResource(this, `SmtpCredentials-${safe}`, {
+          serviceToken: smtpCredsProvider.serviceToken,
+          properties: {
+            SecretName: secretName,
+            AccessKeyId: accessKey.accessKeyId,
+            SecretAccessKey: accessKey.secretAccessKey.unsafeUnwrap(),
+            Region: region,
+            SmtpEndpoint: smtpEndpoint,
+            SmtpPort: smtpPort,
+            Version: '2',
+          },
+        });
+
+        new cdk.CfnOutput(this, `SmtpSecret-${safe}`, {
+          value: secretName,
+          description: `Secrets Manager secret with SMTP creds for ${rule.from}`,
+        });
+      }
 
       new cdk.CfnOutput(this, 'SmtpEndpoint', {
         value: smtpEndpoint,
-        description: 'SMTP server endpoint',
+        description: 'SMTP server endpoint (shared across all rules)',
       });
 
       new cdk.CfnOutput(this, 'SmtpPort', {
         value: smtpPort,
         description: 'SMTP TLS port',
-      });
-
-      new cdk.CfnOutput(this, 'SmtpCredentialsSecret', {
-        value: secretName,
-        description: 'Secrets Manager secret with ready-to-use SMTP username and password',
       });
     }
 
