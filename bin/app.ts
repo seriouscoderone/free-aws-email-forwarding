@@ -29,4 +29,5 @@ new EmailForwardingStack(app, 'EmailForwarding', {
   rules: config.rules,
   enableSmtpSending: config.enableSmtpSending ?? false,
   existingTxtValues: config.existingTxtValues,
+  existingRuleSetName: config.existingRuleSetName,
 });
