@@ -21,6 +21,15 @@ export interface EmailForwardingStackProps extends cdk.StackProps {
   enableSmtpSending?: boolean;
   /** Existing TXT record values at the domain apex to preserve (e.g. google-site-verification) */
   existingTxtValues?: string[];
+  /**
+   * Name of an SES receipt rule set that already exists in this account/region.
+   * When set, the forwarding rule is added to that rule set instead of creating
+   * (and requiring activation of) a new one. Use this when the account already
+   * has an active rule set — SES allows only one active rule set per account
+   * per region, and switching the active set breaks whatever the current set
+   * handles.
+   */
+  existingRuleSetName?: string;
 }
 
 // Convert an email address into a string safe to embed in IAM user names,
@@ -34,7 +43,7 @@ export class EmailForwardingStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props: EmailForwardingStackProps) {
     super(scope, id, props);
 
-    const { domain, hostedZoneId, rules, enableSmtpSending, existingTxtValues } = props;
+    const { domain, hostedZoneId, rules, enableSmtpSending, existingTxtValues, existingRuleSetName } = props;
 
     // --- Hosted Zone ---
     const hostedZone = route53.HostedZone.fromHostedZoneAttributes(this, 'HostedZone', {
@@ -83,6 +92,10 @@ export class EmailForwardingStack extends cdk.Stack {
       blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
       encryption: s3.BucketEncryption.S3_MANAGED,
       lifecycleRules: [{ expiration: cdk.Duration.days(90) }],
+      // Deliberate: destroying the stack deletes every stored email. The
+      // bucket is a rolling 90-day cache of already-forwarded mail, not the
+      // system of record — the forwarded copies live in the destination
+      // inboxes. RETAIN would leave an orphaned bucket to clean up by hand.
       removalPolicy: cdk.RemovalPolicy.DESTROY,
       autoDeleteObjects: true,
     });
@@ -107,7 +120,7 @@ export class EmailForwardingStack extends cdk.Stack {
     const forwarder = new lambda.NodejsFunction(this, 'ForwarderFunction', {
       entry: path.join(__dirname, '..', 'lambda', 'forwarder.ts'),
       handler: 'handler',
-      runtime: cdk.aws_lambda.Runtime.NODEJS_20_X,
+      runtime: cdk.aws_lambda.Runtime.NODEJS_22_X,
       timeout: cdk.Duration.seconds(30),
       memorySize: 256,
       environment: {
@@ -118,7 +131,7 @@ export class EmailForwardingStack extends cdk.Stack {
       bundling: {
         minify: true,
         sourceMap: true,
-        target: 'node20',
+        target: 'node22',
       },
     });
 
@@ -129,9 +142,14 @@ export class EmailForwardingStack extends cdk.Stack {
     }));
 
     // --- SES Receipt Rule Set + Rules ---
-    const ruleSet = new ses.ReceiptRuleSet(this, 'RuleSet', {
-      receiptRuleSetName: `${id}-rule-set`,
-    });
+    // SES allows one active receipt rule set per account per region. If the
+    // account already has an active set, adopt it (existingRuleSetName)
+    // instead of creating a competing one.
+    const ruleSet = existingRuleSetName
+      ? ses.ReceiptRuleSet.fromReceiptRuleSetName(this, 'RuleSet', existingRuleSetName)
+      : new ses.ReceiptRuleSet(this, 'RuleSet', {
+          receiptRuleSetName: `${id}-rule-set`,
+        });
 
     // Collect all "from" addresses for recipient matching
     const recipients = rules.map(r => r.from);
@@ -166,9 +184,9 @@ export class EmailForwardingStack extends cdk.Stack {
       const smtpCredsHandler = new lambda.NodejsFunction(this, 'SmtpCredsHandler', {
         entry: path.join(__dirname, '..', 'lambda', 'smtp-credentials.ts'),
         handler: 'handler',
-        runtime: cdk.aws_lambda.Runtime.NODEJS_20_X,
+        runtime: cdk.aws_lambda.Runtime.NODEJS_22_X,
         timeout: cdk.Duration.seconds(30),
-        bundling: { minify: true, sourceMap: true, target: 'node20' },
+        bundling: { minify: true, sourceMap: true, target: 'node22' },
       });
 
       smtpCredsHandler.addToRolePolicy(new iam.PolicyStatement({
@@ -243,14 +261,23 @@ export class EmailForwardingStack extends cdk.Stack {
       description: 'S3 bucket storing incoming emails',
     });
 
-    new cdk.CfnOutput(this, 'RuleSetName', {
-      value: `${id}-rule-set`,
-      description: 'SES receipt rule set name (must be manually activated)',
-    });
+    if (existingRuleSetName) {
+      // Adopted an already-existing (typically already-active) rule set:
+      // do NOT tell the operator to switch the active rule set.
+      new cdk.CfnOutput(this, 'RuleSetName', {
+        value: existingRuleSetName,
+        description: 'Existing SES receipt rule set the forwarding rule was added to (no action needed)',
+      });
+    } else {
+      new cdk.CfnOutput(this, 'RuleSetName', {
+        value: `${id}-rule-set`,
+        description: 'SES receipt rule set name (must be manually activated)',
+      });
 
-    new cdk.CfnOutput(this, 'ActivateCommand', {
-      value: `aws ses set-active-receipt-rule-set --rule-set-name ${id}-rule-set`,
-      description: 'Run this command to activate the rule set',
-    });
+      new cdk.CfnOutput(this, 'ActivateCommand', {
+        value: `aws ses set-active-receipt-rule-set --rule-set-name ${id}-rule-set`,
+        description: 'Run this command to activate the rule set',
+      });
+    }
   }
 }

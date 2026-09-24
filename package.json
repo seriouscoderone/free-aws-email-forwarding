@@ -5,6 +5,7 @@
   "license": "Apache-2.0",
   "scripts": {
     "build": "tsc",
+    "test": "jest",
     "cdk": "cdk",
     "deploy": "cdk deploy",
     "diff": "cdk diff",
@@ -12,13 +13,28 @@
     "destroy": "cdk destroy"
   },
   "dependencies": {
-    "aws-cdk-lib": "^2.170.0",
+    "aws-cdk-lib": "^2.270.0",
     "constructs": "^10.4.2"
   },
   "devDependencies": {
+    "@types/jest": "^30.0.0",
     "@types/node": "^22.0.0",
-    "aws-cdk": "^2.170.0",
+    "aws-cdk": "^2.1143.0",
     "esbuild": "^0.27.3",
+    "jest": "^30.5.2",
+    "ts-jest": "^29.4.13",
     "typescript": "~5.7.0"
+  },
+  "jest": {
+    "testEnvironment": "node",
+    "roots": [
+      "<rootDir>/test"
+    ],
+    "testMatch": [
+      "**/*.test.ts"
+    ],
+    "transform": {
+      "^.+\\.tsx?$": "ts-jest"
+    }
   }
 }

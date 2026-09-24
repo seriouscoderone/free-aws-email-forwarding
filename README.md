@@ -16,7 +16,7 @@ Costs essentially nothing on AWS free tier. No servers to manage.
 
 - AWS account with SES **out of sandbox** (or sandbox with verified destination addresses)
 - Domain with a Route53 hosted zone
-- Node.js 18+
+- Node.js 20+
 - AWS CDK CLI: `npm install -g aws-cdk`
 - AWS credentials configured (`aws configure` or `AWS_PROFILE`)
 
@@ -35,7 +35,8 @@ cp config.example.json config.json
 # Deploy
 npx cdk deploy
 
-# Activate the SES receipt rule set (see note below)
+# Activate the SES receipt rule set (see "Activating the Rule Set" below —
+# skip this if you deployed with existingRuleSetName)
 aws ses set-active-receipt-rule-set --rule-set-name EmailForwarding-rule-set
 
 # Test
@@ -68,6 +69,7 @@ Edit `config.json`:
 | `rules` | Yes | Array of forwarding rules |
 | `enableSmtpSending` | No | Create SMTP credentials for sending (default: `false`) |
 | `existingTxtValues` | No | Existing TXT record values at the domain apex to preserve (e.g. `["google-site-verification=abc123"]`) |
+| `existingRuleSetName` | No | Name of an SES receipt rule set that already exists in the account/region. When set, the stack adds its forwarding rule to that rule set instead of creating a new one. See [Activating the Rule Set](#activating-the-rule-set). |
 
 **SES receiving regions:** SES inbound email is only available in `us-east-1`, `us-west-2`, and `eu-west-1`.
 
@@ -75,17 +77,35 @@ Edit `config.json`:
 
 ## Activating the Rule Set
 
-**Important:** AWS SES allows only **one active receipt rule set** per account. When you activate this stack's rule set, any previously active rule set is deactivated.
+**Important:** AWS SES allows only **one active receipt rule set** per account per region. When you activate this stack's rule set, any previously active rule set is deactivated — and **inbound mail handled by that rule set silently stops arriving**. Nothing errors; you find out later. Check what's active before switching:
 
 ```bash
-# Activate
-aws ses set-active-receipt-rule-set --rule-set-name EmailForwarding-rule-set
-
-# Check which rule set is active
+# Check which rule set is active (do this BEFORE activating anything)
 aws ses describe-active-receipt-rule-set
+
+# Activate (only if nothing else is active, or you intend to replace it)
+aws ses set-active-receipt-rule-set --rule-set-name EmailForwarding-rule-set
 ```
 
-If you have existing SES receipt rules (e.g., for another domain), add all forwarding rules to this stack's config so everything runs through one rule set.
+### If the account already has an active rule set
+
+Don't create a competing rule set — adopt the existing one. Set `existingRuleSetName` in `config.json`:
+
+```json
+{
+  "existingRuleSetName": "my-existing-rule-set"
+}
+```
+
+With this set, the stack:
+
+- adds its forwarding rule to the named rule set instead of creating a new one
+- leaves the rule set's other rules intact
+- skips the `ActivateCommand` output — the rule set is already active, so there is nothing to switch (and switching is exactly what this option exists to avoid)
+
+**Rule ordering caveat:** SES evaluates rules within a set **in order**, and a broad rule (e.g. a catch-all for your domain) can shadow a later, more specific rule. The stack's rule is appended to the end of the adopted set. If the existing set contains a catch-all matching your forwarding addresses, reorder the rules in the SES console (or with `aws ses reorder-receipt-rule-set`) so the forwarding rule comes first — otherwise it may never fire.
+
+Alternatively, if the existing rules are simple forwards for another domain, you can add them all to this stack's config so everything runs through one rule set.
 
 ## Gmail "Send mail as" Setup
 
@@ -200,7 +220,7 @@ The verification email goes to your custom domain address, which should be forwa
 npx cdk destroy
 ```
 
-This removes all resources. The S3 bucket and its contents are also deleted (autoDeleteObjects is enabled).
+This removes all resources. The S3 bucket and its contents are also deleted (autoDeleteObjects is enabled). If you deployed with `existingRuleSetName`, only the stack's own forwarding rule is removed from the adopted rule set — the rule set and its other rules are left alone.
 
 To deactivate the rule set without destroying the stack:
 ```bash
