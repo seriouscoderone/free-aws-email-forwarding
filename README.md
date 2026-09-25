@@ -63,13 +63,50 @@ Edit `config.json`:
 
 | Field | Required | Description |
 |-------|----------|-------------|
-| `domain` | Yes | Your domain name |
-| `hostedZoneId` | Yes | Route53 hosted zone ID for the domain |
+| `domain` | Yes* | Your domain name |
+| `hostedZoneId` | Yes* | Route53 hosted zone ID for the domain |
 | `region` | No | AWS region (default: `us-east-1`). Must support SES receiving. |
-| `rules` | Yes | Array of forwarding rules |
+| `rules` | Yes* | Array of forwarding rules |
 | `enableSmtpSending` | No | Create SMTP credentials for sending (default: `false`) |
 | `existingTxtValues` | No | Existing TXT record values at the domain apex to preserve (e.g. `["google-site-verification=abc123"]`) |
-| `existingRuleSetName` | No | Name of an SES receipt rule set that already exists in the account/region. When set, the stack adds its forwarding rule to that rule set instead of creating a new one. See [Activating the Rule Set](#activating-the-rule-set). |
+| `existingRuleSetName` | No | Name of an SES receipt rule set that already exists in the account/region. When set, the stack adds its forwarding rules to that rule set instead of creating a new one. See [Activating the Rule Set](#activating-the-rule-set). |
+| `domains` | Yes* | Multi-domain alternative to `domain`/`hostedZoneId`/`rules`/`existingTxtValues`. See [Multiple Domains](#multiple-domains). |
+
+\* Provide either the single-domain fields (`domain`, `hostedZoneId`, `rules`) **or** a `domains` list — not both.
+
+## Multiple Domains
+
+One deployment can forward for any number of domains. This matters because **AWS allows one active SES receipt rule set per account per region** — deploying this stack once per domain means the deployments fight over the active slot, and whichever one loses has its inbound mail silently dropped (delivered to SES by the MX record, then discarded because its rule set is not the active one; no bounce, no error).
+
+Use the `domains` list instead of the top-level `domain`/`hostedZoneId`/`rules`:
+
+```json
+{
+  "region": "us-east-1",
+  "enableSmtpSending": true,
+  "domains": [
+    {
+      "domain": "example.com",
+      "hostedZoneId": "Z0123456789ABCDEF",
+      "rules": [{ "from": "hello@example.com", "to": "me@gmail.com" }],
+      "existingTxtValues": []
+    },
+    {
+      "domain": "example.org",
+      "hostedZoneId": "ZFEDCBA9876543210",
+      "rules": [{ "from": "hello@example.org", "to": "me@gmail.com" }]
+    }
+  ]
+}
+```
+
+Each domain gets its own SES identity (with DKIM), MX, SPF, and DMARC records, and its own receipt rule. The rule set, S3 bucket, and forwarder Lambda are shared — one deployment, one rule set, exactly one owner.
+
+**Migrating an existing single-domain deployment:** your current `config.json` keeps working unchanged. To add a second domain, convert to the `domains` shape **with your existing domain as the first entry** — the first entry keeps the original resource IDs, so CloudFormation updates in place with no replacement, no DKIM re-verification, and no change to SMTP credentials. Keep it first permanently; reordering the list replaces resources.
+
+**Consolidating two existing deployments** (one stack per domain) is different: destroy the second domain's stack, then add that domain to the surviving deployment's `domains` list. Its IAM users and secrets are recreated, so **its SMTP credentials change and every Gmail "Send mail as" entry configured against them must be re-added** (same caveat as the per-rule credentials note below). Destroy the old stack *before* deploying the consolidated one — both would otherwise try to own DNS records and SES identities for the same domain. Note that destroying the old stack deletes its rule set; if that rule set was the **active** one, activate the surviving deployment's rule set immediately after (or deploy first with `existingRuleSetName` pointed at the old set, then migrate — but the simple destroy-then-activate window is usually fine for personal mail).
+
+**Prefer `domains` over `existingRuleSetName` for multiple domains you own.** `existingRuleSetName` exists for coexisting with a rule set owned by *something else* (another stack, another tool). Using it to chain your own forwarding deployments together leaves the rule set owned by whichever deployment created it — destroy that one and every other domain's rule goes down with it, with no CloudFormation warning, because an adopted rule set is an import, not a dependency. The `domains` list keeps one owner.
 
 **SES receiving regions:** SES inbound email is only available in `us-east-1`, `us-west-2`, and `eu-west-1`.
 
@@ -166,11 +203,11 @@ Outgoing email (Gmail "Send mail as")
 
 ### What gets deployed
 
-- **SES Email Identity** with DKIM (3 CNAME records auto-created)
-- **Route53 records:** MX, SPF (TXT), DMARC (TXT)
-- **S3 bucket** for raw email storage (90-day lifecycle)
-- **Lambda function** for email forwarding
-- **SES Receipt Rule Set** with forwarding rules
+- **SES Email Identity** with DKIM (3 CNAME records auto-created) — one per domain
+- **Route53 records:** MX, SPF (TXT), DMARC (TXT) — one set per domain
+- **S3 bucket** for raw email storage (90-day lifecycle) — shared
+- **Lambda function** for email forwarding — shared
+- **SES Receipt Rule Set** with one forwarding rule per domain
 - **Per-rule IAM User + SMTP credentials** in Secrets Manager (optional, for sending). Each rule gets its own credentials, scoped to only send as its own `from` address.
 - **Custom resource** that converts IAM keys → SES SMTP passwords automatically
 

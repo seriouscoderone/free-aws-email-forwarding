@@ -14,81 +14,86 @@ export interface ForwardingRule {
   to: string;
 }
 
-export interface EmailForwardingStackProps extends cdk.StackProps {
+export interface DomainConfig {
   domain: string;
   hostedZoneId: string;
   rules: ForwardingRule[];
-  enableSmtpSending?: boolean;
   /** Existing TXT record values at the domain apex to preserve (e.g. google-site-verification) */
   existingTxtValues?: string[];
+}
+
+export interface EmailForwardingStackProps extends cdk.StackProps {
+  /**
+   * Domains handled by this deployment. One SES identity, MX/SPF/DMARC
+   * record set, and receipt rule is created per domain; the rule set,
+   * S3 bucket, and forwarder Lambda are shared.
+   *
+   * IMPORTANT: keep the first domain first. The first entry uses the
+   * original (unsuffixed) construct IDs so existing single-domain
+   * deployments upgrade in place; reordering the list replaces resources.
+   */
+  domains?: DomainConfig[];
+  /** @deprecated Legacy single-domain shape; use `domains` instead. */
+  domain?: string;
+  /** @deprecated Legacy single-domain shape; use `domains` instead. */
+  hostedZoneId?: string;
+  /** @deprecated Legacy single-domain shape; use `domains` instead. */
+  rules?: ForwardingRule[];
+  /** @deprecated Legacy single-domain shape; use `domains` instead. */
+  existingTxtValues?: string[];
+  enableSmtpSending?: boolean;
   /**
    * Name of an SES receipt rule set that already exists in this account/region.
-   * When set, the forwarding rule is added to that rule set instead of creating
-   * (and requiring activation of) a new one. Use this when the account already
-   * has an active rule set — SES allows only one active rule set per account
-   * per region, and switching the active set breaks whatever the current set
-   * handles.
+   * When set, the forwarding rules are added to that rule set instead of
+   * creating (and requiring activation of) a new one. Use this when the
+   * account already has an active rule set — SES allows only one active rule
+   * set per account per region, and switching the active set breaks whatever
+   * the current set handles.
    */
   existingRuleSetName?: string;
 }
 
-// Convert an email address into a string safe to embed in IAM user names,
-// Secrets Manager secret names, and CDK construct IDs.
+// Convert an email address or domain into a string safe to embed in IAM user
+// names, Secrets Manager secret names, and CDK construct IDs.
 // e.g. "alice.smith@example.com" -> "alice-smith-example-com"
 function sanitizeForResourceName(addr: string): string {
   return addr.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+}
+
+function normalizeDomains(props: EmailForwardingStackProps): DomainConfig[] {
+  const hasLegacy = props.domain !== undefined || props.hostedZoneId !== undefined || props.rules !== undefined;
+  if (props.domains && hasLegacy) {
+    throw new Error('Specify either `domains` or the legacy `domain`/`hostedZoneId`/`rules` fields, not both.');
+  }
+  if (props.domains) {
+    if (props.domains.length === 0) {
+      throw new Error('`domains` must contain at least one domain.');
+    }
+    return props.domains;
+  }
+  if (!props.domain || !props.hostedZoneId || !props.rules?.length) {
+    throw new Error('Provide `domains`, or the legacy `domain`, `hostedZoneId`, and `rules` fields.');
+  }
+  return [{
+    domain: props.domain,
+    hostedZoneId: props.hostedZoneId,
+    rules: props.rules,
+    existingTxtValues: props.existingTxtValues,
+  }];
 }
 
 export class EmailForwardingStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props: EmailForwardingStackProps) {
     super(scope, id, props);
 
-    const { domain, hostedZoneId, rules, enableSmtpSending, existingTxtValues, existingRuleSetName } = props;
-
-    // --- Hosted Zone ---
-    const hostedZone = route53.HostedZone.fromHostedZoneAttributes(this, 'HostedZone', {
-      hostedZoneId,
-      zoneName: domain,
-    });
-
-    // --- SES Domain Identity + DKIM ---
-    const emailIdentity = new ses.EmailIdentity(this, 'EmailIdentity', {
-      identity: ses.Identity.publicHostedZone(hostedZone),
-    });
-
-    // --- Route53 DNS Records ---
+    const { enableSmtpSending, existingRuleSetName } = props;
+    const domains = normalizeDomains(props);
     const region = cdk.Stack.of(this).region;
+    const account = cdk.Stack.of(this).account;
 
-    new route53.MxRecord(this, 'MxRecord', {
-      zone: hostedZone,
-      values: [{ priority: 10, hostName: `inbound-smtp.${region}.amazonaws.com` }],
-    });
-
-    // Use CfnRecordSet for the apex TXT record so we can merge SPF with
-    // any existing TXT values (e.g. google-site-verification). Route53
-    // only allows one TXT record set per name.
-    const txtValues = [
-      '"v=spf1 include:amazonses.com -all"',
-      ...(existingTxtValues || []).map(v => `"${v}"`),
-    ];
-
-    new route53.CfnRecordSet(this, 'SpfRecord', {
-      hostedZoneId,
-      name: `${domain}.`,
-      type: 'TXT',
-      ttl: '1800',
-      resourceRecords: txtValues,
-    });
-
-    new route53.TxtRecord(this, 'DmarcRecord', {
-      zone: hostedZone,
-      recordName: `_dmarc.${domain}`,
-      values: [`v=DMARC1; p=reject; rua=mailto:${rules[0].from}`],
-    });
-
-    // --- S3 Bucket for raw emails ---
+    // --- S3 Bucket for raw emails (shared across domains) ---
     const emailBucket = new s3.Bucket(this, 'EmailBucket', {
-      bucketName: `${id.toLowerCase()}-emails-${cdk.Stack.of(this).account}`,
+      bucketName: `${id.toLowerCase()}-emails-${account}`,
       blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
       encryption: s3.BucketEncryption.S3_MANAGED,
       lifecycleRules: [{ expiration: cdk.Duration.days(90) }],
@@ -107,14 +112,16 @@ export class EmailForwardingStack extends cdk.Stack {
       actions: ['s3:PutObject'],
       resources: [`${emailBucket.bucketArn}/incoming/*`],
       conditions: {
-        StringEquals: { 'AWS:SourceAccount': cdk.Stack.of(this).account },
+        StringEquals: { 'AWS:SourceAccount': account },
       },
     }));
 
-    // --- Forwarding Lambda ---
+    // --- Forwarding Lambda (shared; mapping covers every domain) ---
     const forwardMapping: Record<string, string> = {};
-    for (const rule of rules) {
-      forwardMapping[rule.from] = rule.to;
+    for (const d of domains) {
+      for (const rule of d.rules) {
+        forwardMapping[rule.from] = rule.to;
+      }
     }
 
     const forwarder = new lambda.NodejsFunction(this, 'ForwarderFunction', {
@@ -126,7 +133,6 @@ export class EmailForwardingStack extends cdk.Stack {
       environment: {
         EMAIL_BUCKET: emailBucket.bucketName,
         FORWARD_MAPPING: JSON.stringify(forwardMapping),
-        DOMAIN: domain,
       },
       bundling: {
         minify: true,
@@ -141,7 +147,7 @@ export class EmailForwardingStack extends cdk.Stack {
       resources: ['*'],
     }));
 
-    // --- SES Receipt Rule Set + Rules ---
+    // --- SES Receipt Rule Set (shared; exactly one owner) ---
     // SES allows one active receipt rule set per account per region. If the
     // account already has an active set, adopt it (existingRuleSetName)
     // instead of creating a competing one.
@@ -151,24 +157,71 @@ export class EmailForwardingStack extends cdk.Stack {
           receiptRuleSetName: `${id}-rule-set`,
         });
 
-    // Collect all "from" addresses for recipient matching
-    const recipients = rules.map(r => r.from);
+    // --- Per-domain resources ---
+    // The first domain uses the original construct IDs so existing
+    // single-domain deployments upgrade in place with no resource
+    // replacement. Additional domains get domain-suffixed IDs.
+    let previousRule: ses.ReceiptRule | undefined;
 
-    new ses.ReceiptRule(this, 'ForwardingRule', {
-      ruleSet,
-      recipients,
-      scanEnabled: true,
-      actions: [
-        new sesActions.S3({
-          bucket: emailBucket,
-          objectKeyPrefix: 'incoming/',
-        }),
-        new sesActions.Lambda({
-          function: forwarder,
-          invocationType: sesActions.LambdaInvocationType.EVENT,
-        }),
-      ],
-    });
+    for (const [index, d] of domains.entries()) {
+      const suffix = index === 0 ? '' : `-${sanitizeForResourceName(d.domain)}`;
+
+      const hostedZone = route53.HostedZone.fromHostedZoneAttributes(this, `HostedZone${suffix}`, {
+        hostedZoneId: d.hostedZoneId,
+        zoneName: d.domain,
+      });
+
+      // SES Domain Identity + DKIM
+      new ses.EmailIdentity(this, `EmailIdentity${suffix}`, {
+        identity: ses.Identity.publicHostedZone(hostedZone),
+      });
+
+      new route53.MxRecord(this, `MxRecord${suffix}`, {
+        zone: hostedZone,
+        values: [{ priority: 10, hostName: `inbound-smtp.${region}.amazonaws.com` }],
+      });
+
+      // Use CfnRecordSet for the apex TXT record so we can merge SPF with
+      // any existing TXT values (e.g. google-site-verification). Route53
+      // only allows one TXT record set per name.
+      const txtValues = [
+        '"v=spf1 include:amazonses.com -all"',
+        ...(d.existingTxtValues || []).map(v => `"${v}"`),
+      ];
+
+      new route53.CfnRecordSet(this, `SpfRecord${suffix}`, {
+        hostedZoneId: d.hostedZoneId,
+        name: `${d.domain}.`,
+        type: 'TXT',
+        ttl: '1800',
+        resourceRecords: txtValues,
+      });
+
+      new route53.TxtRecord(this, `DmarcRecord${suffix}`, {
+        zone: hostedZone,
+        recordName: `_dmarc.${d.domain}`,
+        values: [`v=DMARC1; p=reject; rua=mailto:${d.rules[0].from}`],
+      });
+
+      // One receipt rule per domain, chained with `after` so evaluation
+      // order within the rule set is deterministic.
+      previousRule = new ses.ReceiptRule(this, `ForwardingRule${suffix}`, {
+        ruleSet,
+        after: previousRule,
+        recipients: d.rules.map(r => r.from),
+        scanEnabled: true,
+        actions: [
+          new sesActions.S3({
+            bucket: emailBucket,
+            objectKeyPrefix: 'incoming/',
+          }),
+          new sesActions.Lambda({
+            function: forwarder,
+            invocationType: sesActions.LambdaInvocationType.EVENT,
+          }),
+        ],
+      });
+    }
 
     // --- SMTP Sending Credentials (conditional) ---
     // One IAM user, access key, and Secrets Manager entry per rule.
@@ -176,7 +229,6 @@ export class EmailForwardingStack extends cdk.Stack {
     // can only send mail with their own address in the From header — even
     // though the underlying SES identity (the domain) covers all addresses.
     if (enableSmtpSending) {
-      const domainArn = `arn:aws:ses:${region}:${cdk.Stack.of(this).account}:identity/${domain}`;
       const smtpEndpoint = `email-smtp.${region}.amazonaws.com`;
       const smtpPort = '587';
 
@@ -196,7 +248,7 @@ export class EmailForwardingStack extends cdk.Stack {
           'secretsmanager:DeleteSecret',
         ],
         resources: [
-          `arn:aws:secretsmanager:${region}:${cdk.Stack.of(this).account}:secret:${id}/smtp/*`,
+          `arn:aws:secretsmanager:${region}:${account}:secret:${id}/smtp/*`,
         ],
       }));
 
@@ -204,44 +256,50 @@ export class EmailForwardingStack extends cdk.Stack {
         onEventHandler: smtpCredsHandler,
       });
 
-      for (const rule of rules) {
-        const safe = sanitizeForResourceName(rule.from);
+      for (const d of domains) {
+        // Each user may only send via its own domain's identity...
+        const domainArn = `arn:aws:ses:${region}:${account}:identity/${d.domain}`;
 
-        const smtpUser = new iam.User(this, `SmtpUser-${safe}`, {
-          userName: `${id}-smtp-${safe}`,
-        });
+        for (const rule of d.rules) {
+          const safe = sanitizeForResourceName(rule.from);
 
-        smtpUser.addToPolicy(new iam.PolicyStatement({
-          actions: ['ses:SendRawEmail'],
-          resources: [domainArn],
-          conditions: {
-            StringEquals: { 'ses:FromAddress': rule.from },
-          },
-        }));
+          const smtpUser = new iam.User(this, `SmtpUser-${safe}`, {
+            userName: `${id}-smtp-${safe}`,
+          });
 
-        const accessKey = new iam.AccessKey(this, `SmtpAccessKey-${safe}`, {
-          user: smtpUser,
-        });
+          // ...and only with its own address in the From header.
+          smtpUser.addToPolicy(new iam.PolicyStatement({
+            actions: ['ses:SendRawEmail'],
+            resources: [domainArn],
+            conditions: {
+              StringEquals: { 'ses:FromAddress': rule.from },
+            },
+          }));
 
-        const secretName = `${id}/smtp/${safe}`;
+          const accessKey = new iam.AccessKey(this, `SmtpAccessKey-${safe}`, {
+            user: smtpUser,
+          });
 
-        new cdk.CustomResource(this, `SmtpCredentials-${safe}`, {
-          serviceToken: smtpCredsProvider.serviceToken,
-          properties: {
-            SecretName: secretName,
-            AccessKeyId: accessKey.accessKeyId,
-            SecretAccessKey: accessKey.secretAccessKey.unsafeUnwrap(),
-            Region: region,
-            SmtpEndpoint: smtpEndpoint,
-            SmtpPort: smtpPort,
-            Version: '2',
-          },
-        });
+          const secretName = `${id}/smtp/${safe}`;
 
-        new cdk.CfnOutput(this, `SmtpSecret-${safe}`, {
-          value: secretName,
-          description: `Secrets Manager secret with SMTP creds for ${rule.from}`,
-        });
+          new cdk.CustomResource(this, `SmtpCredentials-${safe}`, {
+            serviceToken: smtpCredsProvider.serviceToken,
+            properties: {
+              SecretName: secretName,
+              AccessKeyId: accessKey.accessKeyId,
+              SecretAccessKey: accessKey.secretAccessKey.unsafeUnwrap(),
+              Region: region,
+              SmtpEndpoint: smtpEndpoint,
+              SmtpPort: smtpPort,
+              Version: '2',
+            },
+          });
+
+          new cdk.CfnOutput(this, `SmtpSecret-${safe}`, {
+            value: secretName,
+            description: `Secrets Manager secret with SMTP creds for ${rule.from}`,
+          });
+        }
       }
 
       new cdk.CfnOutput(this, 'SmtpEndpoint', {
@@ -266,7 +324,7 @@ export class EmailForwardingStack extends cdk.Stack {
       // do NOT tell the operator to switch the active rule set.
       new cdk.CfnOutput(this, 'RuleSetName', {
         value: existingRuleSetName,
-        description: 'Existing SES receipt rule set the forwarding rule was added to (no action needed)',
+        description: 'Existing SES receipt rule set the forwarding rules were added to (no action needed)',
       });
     } else {
       new cdk.CfnOutput(this, 'RuleSetName', {

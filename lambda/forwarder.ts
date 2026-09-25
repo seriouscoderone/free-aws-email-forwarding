@@ -6,7 +6,6 @@ const sesClient = new SESClient({});
 
 const BUCKET = process.env.EMAIL_BUCKET!;
 const FORWARD_MAPPING: Record<string, string> = JSON.parse(process.env.FORWARD_MAPPING || '{}');
-const DOMAIN = process.env.DOMAIN!;
 
 interface SESEventRecord {
   ses: {
@@ -69,7 +68,7 @@ export async function handler(event: SESEvent): Promise<void> {
   }
 }
 
-function rewriteEmail(raw: string, forwardFrom: string, _destination: string): string {
+export function rewriteEmail(raw: string, forwardFrom: string, _destination: string): string {
   // Split headers and body
   const headerEndIndex = raw.indexOf('\r\n\r\n');
   if (headerEndIndex === -1) {
@@ -113,11 +112,13 @@ function rewriteWithSplit(raw: string, splitIndex: number, separator: string, fo
     // Skip continuation lines of DKIM-Signature
     if (newLines.length > 0 && newLines[newLines.length - 1] === '__SKIP__' && line.match(/^\s/)) continue;
 
-    // Rewrite From header
+    // Rewrite From header. The "via" domain is the forwarding address's
+    // own domain, so one deployment can span multiple domains.
     if (line.match(/^From:\s/i)) {
+      const viaDomain = forwardFrom.split('@')[1] ?? forwardFrom;
       const displayName = originalName
-        ? `${originalName} via ${DOMAIN}`
-        : `${originalEmail} via ${DOMAIN}`;
+        ? `${originalName} via ${viaDomain}`
+        : `${originalEmail} via ${viaDomain}`;
       newLines.push(`From: "${displayName}" <${forwardFrom}>`);
 
       // Add Reply-To if not already present
