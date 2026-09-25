@@ -22,6 +22,31 @@ export interface DomainConfig {
   rules: ForwardingRule[];
   /** Existing TXT record values at the domain apex to preserve (e.g. google-site-verification) */
   existingTxtValues?: string[];
+  /**
+   * Default true. Set false when the domain's SES identity is created and
+   * managed by something else (typically the application stack that sends
+   * mail from this domain) — creating a second identity for the same domain
+   * fails CloudFormation's early validation with "already exists". When
+   * false, the DKIM record sets are skipped too, since the identity's owner
+   * is already publishing them; MX, SPF, DMARC, and the receipt rule are
+   * still created. The identity must actually be verified: if SMTP sending
+   * is enabled the deploy checks this and fails clearly, otherwise it is on
+   * you — an unverified identity means forwarding silently never works.
+   */
+  createIdentity?: boolean;
+  /**
+   * Full DMARC record value. Default: `v=DMARC1; p=reject; rua=mailto:<first
+   * rule's address>`. That default is right for a domain this stack is
+   * introducing and wrong to impose on one that already sends mail: under
+   * p=reject, any existing sender that fails SPF/DKIM alignment stops being
+   * a line in a report and becomes mail that silently never arrives. For a
+   * domain with existing senders, start at p=quarantine, watch the aggregate
+   * reports (rua) for a few weeks, and tighten once everything legitimate
+   * aligns. Note the deploy REPLACES any DMARC record already at
+   * _dmarc.<domain>. Set to null to skip creating the record entirely, for
+   * operators who manage DMARC elsewhere.
+   */
+  dmarc?: string | null;
 }
 
 export type StackMode = 'send-only' | 'receive-only' | 'both';
@@ -229,10 +254,13 @@ export class EmailForwardingStack extends cdk.Stack {
         zoneName: d.domain,
       });
 
-      // SES Domain Identity + DKIM
-      new ses.EmailIdentity(this, `EmailIdentity${suffix}`, {
-        identity: ses.Identity.publicHostedZone(hostedZone),
-      });
+      // SES Domain Identity + DKIM — skipped when another stack owns the
+      // identity (and is therefore already publishing the DKIM records).
+      if (d.createIdentity !== false) {
+        new ses.EmailIdentity(this, `EmailIdentity${suffix}`, {
+          identity: ses.Identity.publicHostedZone(hostedZone),
+        });
+      }
 
       new route53.MxRecord(this, `MxRecord${suffix}`, {
         zone: hostedZone,
@@ -255,11 +283,14 @@ export class EmailForwardingStack extends cdk.Stack {
         resourceRecords: txtValues,
       });
 
-      new route53.TxtRecord(this, `DmarcRecord${suffix}`, {
-        zone: hostedZone,
-        recordName: `_dmarc.${d.domain}`,
-        values: [`v=DMARC1; p=reject; rua=mailto:${d.rules[0].from}`],
-      });
+      // dmarc: null means the operator manages the DMARC record elsewhere.
+      if (d.dmarc !== null) {
+        new route53.TxtRecord(this, `DmarcRecord${suffix}`, {
+          zone: hostedZone,
+          recordName: `_dmarc.${d.domain}`,
+          values: [d.dmarc ?? `v=DMARC1; p=reject; rua=mailto:${d.rules[0].from}`],
+        });
+      }
 
       // One receipt rule per domain, chained with `after` so evaluation
       // order within the rule set is deterministic.
@@ -344,7 +375,7 @@ export class EmailForwardingStack extends cdk.Stack {
         ],
       }));
 
-      if (mode === 'send-only') {
+      if (mode === 'send-only' || domains.some(d => d.createIdentity === false)) {
         // The handler verifies the identity before minting credentials
         // (this API does not support resource-level scoping).
         smtpCredsHandler.addToRolePolicy(new iam.PolicyStatement({
@@ -393,10 +424,12 @@ export class EmailForwardingStack extends cdk.Stack {
               SmtpEndpoint: smtpEndpoint,
               SmtpPort: smtpPort,
               Version: '2',
-              // In send-only mode this stack did not create the identity,
-              // so the handler checks it is verified before minting
-              // credentials that would otherwise fail at send time.
-              ...(mode === 'send-only' ? { VerifyIdentityDomain: d.domain } : {}),
+              // Whenever this stack did not create the identity (send-only
+              // mode, or createIdentity: false), the handler checks it is
+              // verified before minting credentials that would otherwise
+              // fail at send time.
+              ...(mode === 'send-only' || d.createIdentity === false
+                ? { VerifyIdentityDomain: d.domain } : {}),
             },
           });
 

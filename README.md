@@ -104,6 +104,40 @@ Use the `domains` list instead of the top-level `domain`/`hostedZoneId`/`rules`:
 
 Each domain gets its own SES identity (with DKIM), MX, SPF, and DMARC records, and its own receipt rule. The rule set, S3 bucket, and forwarder Lambda are shared — one deployment, one rule set, exactly one owner.
 
+### Adding forwarding to a domain that already sends mail
+
+If the account already has a verified SES identity for the domain — typically created by the application stack that sends from it — this stack's own identity fails CloudFormation validation with "already exists". Set `createIdentity: false` on that domain:
+
+```json
+{
+  "domain": "example.com",
+  "hostedZoneId": "Z0123456789ABCDEF",
+  "createIdentity": false,
+  "rules": [{ "from": "info@example.com", "to": "me@gmail.com" }]
+}
+```
+
+The stack then skips the identity and its DKIM records (the identity's owner is already publishing those) but still creates the MX record, apex SPF TXT, DMARC record, and the receipt rule — the receiving pieces the sending stack has no reason to own. Combined with `mode: "receive-only"`, this is the complete shape for "add inbound forwarding to my app's domain, touch nothing about how it sends."
+
+**The identity must actually be verified.** `createIdentity: false` asserts that something else did that job; if it didn't, the deploy succeeds and inbound forwarding silently never works. With `enableSmtpSending` the deploy checks this and fails clearly; without it, check yourself: `aws ses get-identity-verification-attributes --identities example.com`.
+
+Two DMARC-related caveats when adopting a domain that already sends mail: the default DMARC record this stack writes is `p=reject`, and deploying **replaces** any DMARC record already at `_dmarc.<domain>` (Route53 allows one record set per name/type). Both are configurable — see below.
+
+### Custom DMARC policy
+
+The default DMARC record is `v=DMARC1; p=reject; rua=mailto:<first rule's address>` — right for a fresh domain this stack introduces, wrong to impose on one with existing senders, where `p=reject` turns any SPF/DKIM alignment gap into mail that silently bounces. Set the full record value per domain:
+
+```json
+{
+  "domain": "example.com",
+  "hostedZoneId": "Z0123456789ABCDEF",
+  "dmarc": "v=DMARC1; p=quarantine; rua=mailto:dmarc-reports@example.com; pct=100",
+  "rules": [{ "from": "info@example.com", "to": "me@gmail.com" }]
+}
+```
+
+For a domain with existing senders: start at `p=quarantine`, point `rua` at a monitored inbox or DMARC analytics service, watch the aggregate reports for a few weeks, then tighten to `p=reject` once everything legitimate aligns. Set `"dmarc": null` to skip the record entirely if you manage DMARC elsewhere. Either way, remember that deploying with a `dmarc` value (including the default) **replaces** whatever DMARC record the domain already has.
+
 **Migrating an existing single-domain deployment:** your current `config.json` keeps working unchanged. To add a second domain, convert to the `domains` shape **with your existing domain as the first entry** — the first entry keeps the original resource IDs, so CloudFormation updates in place with no replacement, no DKIM re-verification, and no change to SMTP credentials. Keep it first permanently; reordering the list replaces resources.
 
 **Consolidating two existing deployments** (one stack per domain) is different: destroy the second domain's stack, then add that domain to the surviving deployment's `domains` list. Its IAM users and secrets are recreated, so **its SMTP credentials change and every Gmail "Send mail as" entry configured against them must be re-added** (same caveat as the per-rule credentials note below). Destroy the old stack *before* deploying the consolidated one — both would otherwise try to own DNS records and SES identities for the same domain. Note that destroying the old stack deletes its rule set; if that rule set was the **active** one, activate the surviving deployment's rule set immediately after (or deploy first with `existingRuleSetName` pointed at the old set, then migrate — but the simple destroy-then-activate window is usually fine for personal mail).
