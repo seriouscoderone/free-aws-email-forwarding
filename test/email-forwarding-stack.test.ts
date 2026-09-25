@@ -329,6 +329,110 @@ describe('two deployments in one account (configurable stack name)', () => {
   });
 });
 
+describe('createIdentity: false (identity owned elsewhere)', () => {
+  function synthNoIdentity(extra: object = {}): Template {
+    const app = new cdk.App();
+    const stack = new EmailForwardingStack(app, 'TestStack', {
+      env: { account: '123456789012', region: 'us-east-1' },
+      domains: [{
+        domain: 'example.com',
+        hostedZoneId: 'Z0123456789ABCDEF',
+        createIdentity: false,
+        rules: [{ from: 'info@example.com', to: 'me@gmail.com' }],
+      }],
+      ...extra,
+    });
+    return Template.fromStack(stack);
+  }
+
+  test('skips the SES identity and its DKIM records', () => {
+    const template = synthNoIdentity();
+    template.resourceCountIs('AWS::SES::EmailIdentity', 0);
+    const records = Object.values(template.findResources('AWS::Route53::RecordSet'));
+    const dkim = records.filter(r => String(r.Properties.Name).includes('_domainkey'));
+    expect(dkim).toHaveLength(0);
+  });
+
+  test('still creates MX, apex TXT, DMARC, and the receipt rule', () => {
+    const template = synthNoIdentity();
+    const records = Object.values(template.findResources('AWS::Route53::RecordSet'));
+    const byType = (t: string) => records.filter(r => r.Properties.Type === t);
+    expect(byType('MX').map(r => r.Properties.Name)).toEqual(['example.com.']);
+    expect(byType('TXT').map(r => r.Properties.Name).sort())
+      .toEqual(['_dmarc.example.com.', 'example.com.']);
+    template.resourceCountIs('AWS::SES::ReceiptRule', 1);
+  });
+
+  test('SMTP credentials for the domain get the deploy-time identity verification check', () => {
+    const template = synthNoIdentity({ enableSmtpSending: true });
+    const resources = Object.values(template.findResources('AWS::CloudFormation::CustomResource'));
+    expect(resources).toHaveLength(1);
+    expect(resources[0].Properties.VerifyIdentityDomain).toBe('example.com');
+  });
+
+  test('the check applies only to domains whose identity the stack did not create', () => {
+    const app = new cdk.App();
+    const stack = new EmailForwardingStack(app, 'TestStack', {
+      env: { account: '123456789012', region: 'us-east-1' },
+      enableSmtpSending: true,
+      domains: [
+        {
+          domain: 'example.com',
+          hostedZoneId: 'Z1',
+          rules: [{ from: 'hello@example.com', to: 'me@gmail.com' }],
+        },
+        {
+          domain: 'example.org',
+          hostedZoneId: 'Z2',
+          createIdentity: false,
+          rules: [{ from: 'info@example.org', to: 'me@gmail.com' }],
+        },
+      ],
+    });
+    const template = Template.fromStack(stack);
+    template.resourceCountIs('AWS::SES::EmailIdentity', 1);
+    const verify = Object.values(template.findResources('AWS::CloudFormation::CustomResource'))
+      .map(r => r.Properties.VerifyIdentityDomain);
+    expect(verify.sort()).toEqual(['example.org', undefined]);
+  });
+});
+
+describe('configurable dmarc', () => {
+  function synthDmarc(dmarc: string | null | undefined): Template {
+    const app = new cdk.App();
+    const stack = new EmailForwardingStack(app, 'TestStack', {
+      env: { account: '123456789012', region: 'us-east-1' },
+      domains: [{
+        domain: 'example.com',
+        hostedZoneId: 'Z0123456789ABCDEF',
+        rules: [{ from: 'hello@example.com', to: 'me@gmail.com' }],
+        ...(dmarc === undefined ? {} : { dmarc }),
+      }],
+    });
+    return Template.fromStack(stack);
+  }
+
+  function dmarcValues(template: Template): string[][] {
+    return Object.values(template.findResources('AWS::Route53::RecordSet'))
+      .filter(r => String(r.Properties.Name).startsWith('_dmarc.'))
+      .map(r => r.Properties.ResourceRecords);
+  }
+
+  test('omitted: the current default value, unchanged', () => {
+    expect(dmarcValues(synthDmarc(undefined)))
+      .toEqual([['"v=DMARC1; p=reject; rua=mailto:hello@example.com"']]);
+  });
+
+  test('set: the exact configured string becomes the record value', () => {
+    const custom = 'v=DMARC1; p=quarantine; rua=mailto:dmarc-reports@example.com; pct=100';
+    expect(dmarcValues(synthDmarc(custom))).toEqual([[`"${custom}"`]]);
+  });
+
+  test('null: no DMARC record is created at all', () => {
+    expect(dmarcValues(synthDmarc(null))).toEqual([]);
+  });
+});
+
 describe('existingRuleSetName set', () => {
   const existing = { existingRuleSetName: 'sla-harness-ses-harness' };
 
