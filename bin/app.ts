@@ -20,19 +20,30 @@ if (config.domains && hasLegacy) {
   process.exit(1);
 }
 
+const mode = config.mode ?? 'both';
+if (!['send-only', 'receive-only', 'both'].includes(mode)) {
+  console.error(`Unknown mode "${config.mode}". Use "send-only", "receive-only", or "both".`);
+  process.exit(1);
+}
+const sendOnly = mode === 'send-only';
+
 if (config.domains) {
-  for (const d of config.domains) {
-    if (!d.domain || !d.hostedZoneId || !d.rules?.length) {
-      console.error('Each entry in "domains" must include domain, hostedZoneId, and at least one rule.');
-      process.exit(1);
-    }
-  }
   if (config.domains.length === 0) {
     console.error('"domains" must contain at least one domain.');
     process.exit(1);
   }
-} else if (!config.domain || !config.hostedZoneId || !config.rules?.length) {
-  console.error('config.json must include domain, hostedZoneId, and at least one rule (or a "domains" list).');
+  for (const d of config.domains) {
+    if (!d.domain || !d.rules?.length || (!sendOnly && !d.hostedZoneId)) {
+      console.error(`Each entry in "domains" must include domain${sendOnly ? '' : ', hostedZoneId,'} and at least one rule.`);
+      process.exit(1);
+    }
+    if (!sendOnly && d.rules.some((r: { to?: string }) => !r.to)) {
+      console.error('Each rule needs a "to" forwarding destination (only send-only mode may omit it).');
+      process.exit(1);
+    }
+  }
+} else if (!config.domain || !config.rules?.length || (!sendOnly && !config.hostedZoneId)) {
+  console.error(`config.json must include domain${sendOnly ? '' : ', hostedZoneId,'} and at least one rule (or a "domains" list).`);
   process.exit(1);
 }
 
@@ -42,11 +53,12 @@ new EmailForwardingStack(app, 'EmailForwarding', {
   env: {
     region: config.region || 'us-east-1',
   },
+  mode: config.mode,
   domains: config.domains,
   domain: config.domain,
   hostedZoneId: config.hostedZoneId,
   rules: config.rules,
-  enableSmtpSending: config.enableSmtpSending ?? false,
+  enableSmtpSending: config.enableSmtpSending,
   existingTxtValues: config.existingTxtValues,
   existingRuleSetName: config.existingRuleSetName,
 });

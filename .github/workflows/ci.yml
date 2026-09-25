@@ -26,3 +26,8 @@ jobs:
         run: |
           cp config.example.json config.json
           npx cdk synth --quiet
+
+      - name: Synthesize send-only mode
+        run: |
+          echo '{"mode":"send-only","region":"us-east-1","domains":[{"domain":"example.com","rules":[{"from":"hello@example.com"}]}]}' > config.json
+          npx cdk synth --quiet

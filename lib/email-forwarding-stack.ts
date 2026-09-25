@@ -11,16 +11,20 @@ import * as path from 'path';
 
 export interface ForwardingRule {
   from: string;
-  to: string;
+  /** Forwarding destination. Required except in send-only mode, where mail is never received. */
+  to?: string;
 }
 
 export interface DomainConfig {
   domain: string;
-  hostedZoneId: string;
+  /** Route53 hosted zone for the domain. Required except in send-only mode, which touches no DNS. */
+  hostedZoneId?: string;
   rules: ForwardingRule[];
   /** Existing TXT record values at the domain apex to preserve (e.g. google-site-verification) */
   existingTxtValues?: string[];
 }
+
+export type StackMode = 'send-only' | 'receive-only' | 'both';
 
 export interface EmailForwardingStackProps extends cdk.StackProps {
   /**
@@ -42,6 +46,22 @@ export interface EmailForwardingStackProps extends cdk.StackProps {
   /** @deprecated Legacy single-domain shape; use `domains` instead. */
   existingTxtValues?: string[];
   enableSmtpSending?: boolean;
+  /**
+   * What this deployment provisions (default 'both'):
+   * - 'both': receiving infrastructure, plus SMTP credentials when
+   *   enableSmtpSending is set — exactly the behaviour before this
+   *   option existed.
+   * - 'send-only': ONLY the per-address IAM users, access keys, and
+   *   SMTP secrets. No S3 bucket, Lambda, receipt rule/set, identity,
+   *   or DNS records. For accounts that hold SES production sending
+   *   access while the domain's DNS (and the receiving stack) live in
+   *   a different account. The domain identity must already be
+   *   verified in this account — the credentials custom resource
+   *   checks and fails the deploy otherwise.
+   * - 'receive-only': the receiving infrastructure with no SMTP
+   *   credentials; the explicit form of enableSmtpSending: false.
+   */
+  mode?: StackMode;
   /**
    * Name of an SES receipt rule set that already exists in this account/region.
    * When set, the forwarding rules are added to that rule set instead of
@@ -71,7 +91,7 @@ function normalizeDomains(props: EmailForwardingStackProps): DomainConfig[] {
     }
     return props.domains;
   }
-  if (!props.domain || !props.hostedZoneId || !props.rules?.length) {
+  if (!props.domain || !props.rules?.length) {
     throw new Error('Provide `domains`, or the legacy `domain`, `hostedZoneId`, and `rules` fields.');
   }
   return [{
@@ -87,10 +107,48 @@ export class EmailForwardingStack extends cdk.Stack {
     super(scope, id, props);
 
     const { enableSmtpSending, existingRuleSetName } = props;
+    const mode: StackMode = props.mode ?? 'both';
     const domains = normalizeDomains(props);
     const region = cdk.Stack.of(this).region;
     const account = cdk.Stack.of(this).account;
 
+    const receiving = mode !== 'send-only';
+    const sending = mode === 'send-only' || (mode === 'both' && !!enableSmtpSending);
+
+    if (mode === 'receive-only' && enableSmtpSending) {
+      throw new Error('mode "receive-only" contradicts enableSmtpSending: true — drop one of them.');
+    }
+    if (mode === 'send-only' && enableSmtpSending === false) {
+      throw new Error('mode "send-only" exists only to provision SMTP credentials — remove enableSmtpSending: false.');
+    }
+    if (receiving) {
+      for (const d of domains) {
+        if (!d.hostedZoneId) {
+          throw new Error(`Domain ${d.domain} needs a hostedZoneId (required except in send-only mode).`);
+        }
+        for (const rule of d.rules) {
+          if (!rule.to) {
+            throw new Error(`Rule for ${rule.from} needs a "to" forwarding destination (required except in send-only mode).`);
+          }
+        }
+      }
+    }
+
+    if (receiving) {
+      this.buildReceiving(id, domains, region, account, existingRuleSetName);
+    }
+    if (sending) {
+      this.buildSmtpCredentials(id, domains, region, account, mode);
+    }
+  }
+
+  private buildReceiving(
+    id: string,
+    domains: DomainConfig[],
+    region: string,
+    account: string,
+    existingRuleSetName: string | undefined,
+  ): void {
     // --- S3 Bucket for raw emails (shared across domains) ---
     const emailBucket = new s3.Bucket(this, 'EmailBucket', {
       bucketName: `${id.toLowerCase()}-emails-${account}`,
@@ -120,7 +178,7 @@ export class EmailForwardingStack extends cdk.Stack {
     const forwardMapping: Record<string, string> = {};
     for (const d of domains) {
       for (const rule of d.rules) {
-        forwardMapping[rule.from] = rule.to;
+        forwardMapping[rule.from] = rule.to!;
       }
     }
 
@@ -167,7 +225,7 @@ export class EmailForwardingStack extends cdk.Stack {
       const suffix = index === 0 ? '' : `-${sanitizeForResourceName(d.domain)}`;
 
       const hostedZone = route53.HostedZone.fromHostedZoneAttributes(this, `HostedZone${suffix}`, {
-        hostedZoneId: d.hostedZoneId,
+        hostedZoneId: d.hostedZoneId!,
         zoneName: d.domain,
       });
 
@@ -190,7 +248,7 @@ export class EmailForwardingStack extends cdk.Stack {
       ];
 
       new route53.CfnRecordSet(this, `SpfRecord${suffix}`, {
-        hostedZoneId: d.hostedZoneId,
+        hostedZoneId: d.hostedZoneId!,
         name: `${d.domain}.`,
         type: 'TXT',
         ttl: '1800',
@@ -223,12 +281,46 @@ export class EmailForwardingStack extends cdk.Stack {
       });
     }
 
-    // --- SMTP Sending Credentials (conditional) ---
-    // One IAM user, access key, and Secrets Manager entry per rule.
-    // Each user is scoped via an IAM `ses:FromAddress` condition so they
-    // can only send mail with their own address in the From header — even
-    // though the underlying SES identity (the domain) covers all addresses.
-    if (enableSmtpSending) {
+    // --- Receiving outputs ---
+    new cdk.CfnOutput(this, 'EmailBucketName', {
+      value: emailBucket.bucketName,
+      description: 'S3 bucket storing incoming emails',
+    });
+
+    if (existingRuleSetName) {
+      // Adopted an already-existing (typically already-active) rule set:
+      // do NOT tell the operator to switch the active rule set.
+      new cdk.CfnOutput(this, 'RuleSetName', {
+        value: existingRuleSetName,
+        description: 'Existing SES receipt rule set the forwarding rules were added to (no action needed)',
+      });
+    } else {
+      new cdk.CfnOutput(this, 'RuleSetName', {
+        value: `${id}-rule-set`,
+        description: 'SES receipt rule set name (must be manually activated)',
+      });
+
+      new cdk.CfnOutput(this, 'ActivateCommand', {
+        value: `aws ses set-active-receipt-rule-set --rule-set-name ${id}-rule-set`,
+        description: 'Run this command to activate the rule set',
+      });
+    }
+  }
+
+  // --- SMTP Sending Credentials ---
+  // One IAM user, access key, and Secrets Manager entry per rule.
+  // Each user is scoped via an IAM `ses:FromAddress` condition so they
+  // can only send mail with their own address in the From header — even
+  // though the underlying SES identity (the domain) covers all addresses.
+  // The single implementation serves both 'both' and 'send-only' modes.
+  private buildSmtpCredentials(
+    id: string,
+    domains: DomainConfig[],
+    region: string,
+    account: string,
+    mode: StackMode,
+  ): void {
+    {
       const smtpEndpoint = `email-smtp.${region}.amazonaws.com`;
       const smtpPort = '587';
 
@@ -251,6 +343,15 @@ export class EmailForwardingStack extends cdk.Stack {
           `arn:aws:secretsmanager:${region}:${account}:secret:${id}/smtp/*`,
         ],
       }));
+
+      if (mode === 'send-only') {
+        // The handler verifies the identity before minting credentials
+        // (this API does not support resource-level scoping).
+        smtpCredsHandler.addToRolePolicy(new iam.PolicyStatement({
+          actions: ['ses:GetIdentityVerificationAttributes'],
+          resources: ['*'],
+        }));
+      }
 
       const smtpCredsProvider = new cr.Provider(this, 'SmtpCredsProvider', {
         onEventHandler: smtpCredsHandler,
@@ -292,6 +393,10 @@ export class EmailForwardingStack extends cdk.Stack {
               SmtpEndpoint: smtpEndpoint,
               SmtpPort: smtpPort,
               Version: '2',
+              // In send-only mode this stack did not create the identity,
+              // so the handler checks it is verified before minting
+              // credentials that would otherwise fail at send time.
+              ...(mode === 'send-only' ? { VerifyIdentityDomain: d.domain } : {}),
             },
           });
 
@@ -310,31 +415,6 @@ export class EmailForwardingStack extends cdk.Stack {
       new cdk.CfnOutput(this, 'SmtpPort', {
         value: smtpPort,
         description: 'SMTP TLS port',
-      });
-    }
-
-    // --- Outputs ---
-    new cdk.CfnOutput(this, 'EmailBucketName', {
-      value: emailBucket.bucketName,
-      description: 'S3 bucket storing incoming emails',
-    });
-
-    if (existingRuleSetName) {
-      // Adopted an already-existing (typically already-active) rule set:
-      // do NOT tell the operator to switch the active rule set.
-      new cdk.CfnOutput(this, 'RuleSetName', {
-        value: existingRuleSetName,
-        description: 'Existing SES receipt rule set the forwarding rules were added to (no action needed)',
-      });
-    } else {
-      new cdk.CfnOutput(this, 'RuleSetName', {
-        value: `${id}-rule-set`,
-        description: 'SES receipt rule set name (must be manually activated)',
-      });
-
-      new cdk.CfnOutput(this, 'ActivateCommand', {
-        value: `aws ses set-active-receipt-rule-set --rule-set-name ${id}-rule-set`,
-        description: 'Run this command to activate the rule set',
       });
     }
   }

@@ -180,6 +180,118 @@ describe('multi-domain (domains[])', () => {
   });
 });
 
+describe('send-only mode', () => {
+  function synthSendOnly(): Template {
+    const app = new cdk.App();
+    const stack = new EmailForwardingStack(app, 'TestStack', {
+      env: { account: '123456789012', region: 'us-east-1' },
+      mode: 'send-only',
+      domains: [
+        { domain: 'example.com', rules: [{ from: 'hello@example.com' }] },
+        { domain: 'example.org', rules: [{ from: 'hello@example.org' }] },
+      ],
+    });
+    return Template.fromStack(stack);
+  }
+
+  test('creates no receiving infrastructure at all', () => {
+    const template = synthSendOnly();
+    template.resourceCountIs('AWS::S3::Bucket', 0);
+    template.resourceCountIs('AWS::SES::ReceiptRuleSet', 0);
+    template.resourceCountIs('AWS::SES::ReceiptRule', 0);
+    template.resourceCountIs('AWS::SES::EmailIdentity', 0);
+    template.resourceCountIs('AWS::Route53::RecordSet', 0);
+    const functions = Object.values(template.findResources('AWS::Lambda::Function'));
+    const forwarders = functions.filter(f => f.Properties.Environment?.Variables?.FORWARD_MAPPING);
+    expect(forwarders).toHaveLength(0);
+  });
+
+  test('creates per-address IAM users, secrets, and SMTP outputs', () => {
+    const template = synthSendOnly();
+    template.resourceCountIs('AWS::IAM::User', 2);
+    const policies = Object.values(template.findResources('AWS::IAM::Policy'))
+      .filter(p => p.Properties.Users !== undefined);
+    expect(policies).toHaveLength(2);
+    for (const p of policies) {
+      const stmt = p.Properties.PolicyDocument.Statement[0];
+      expect(stmt.Action).toBe('ses:SendRawEmail');
+      expect(stmt.Condition.StringEquals['ses:FromAddress']).toMatch(/^hello@example\.(com|org)$/);
+    }
+    template.hasOutput('SmtpEndpoint', { Value: 'email-smtp.us-east-1.amazonaws.com' });
+    template.hasOutput('SmtpPort', { Value: '587' });
+    template.hasOutput('SmtpSecrethelloexamplecom', {});
+    template.hasOutput('SmtpSecrethelloexampleorg', {});
+  });
+
+  test('asks the credentials handler to verify the identity exists in the target account', () => {
+    const template = synthSendOnly();
+    const resources = Object.values(template.findResources('AWS::CloudFormation::CustomResource'));
+    expect(resources).toHaveLength(2);
+    const verified = resources.map(r => r.Properties.VerifyIdentityDomain).sort();
+    expect(verified).toEqual(['example.com', 'example.org']);
+  });
+
+  test('emits no receiving-related outputs', () => {
+    const template = synthSendOnly();
+    expect(template.findOutputs('ActivateCommand')).toEqual({});
+    expect(template.findOutputs('RuleSetName')).toEqual({});
+    expect(template.findOutputs('EmailBucketName')).toEqual({});
+  });
+});
+
+describe('receive-only mode', () => {
+  test('creates receiving infrastructure but no SMTP credentials', () => {
+    const app = new cdk.App();
+    const stack = new EmailForwardingStack(app, 'TestStack', {
+      env: { account: '123456789012', region: 'us-east-1' },
+      mode: 'receive-only',
+      ...baseProps,
+    });
+    const template = Template.fromStack(stack);
+    template.resourceCountIs('AWS::S3::Bucket', 1);
+    template.resourceCountIs('AWS::SES::ReceiptRule', 1);
+    template.resourceCountIs('AWS::IAM::User', 0);
+    expect(template.findOutputs('SmtpEndpoint')).toEqual({});
+  });
+
+  test('rejects the contradiction of receive-only with enableSmtpSending', () => {
+    const app = new cdk.App();
+    expect(() => new EmailForwardingStack(app, 'TestStack', {
+      env: { account: '123456789012', region: 'us-east-1' },
+      mode: 'receive-only',
+      enableSmtpSending: true,
+      ...baseProps,
+    })).toThrow(/receive-only/);
+  });
+});
+
+describe('mode validation', () => {
+  test('both mode still requires hostedZoneId', () => {
+    const app = new cdk.App();
+    expect(() => new EmailForwardingStack(app, 'TestStack', {
+      env: { account: '123456789012', region: 'us-east-1' },
+      domains: [{ domain: 'example.com', rules: [{ from: 'a@example.com', to: 'b@x.com' }] }],
+    })).toThrow(/hostedZoneId/);
+  });
+
+  test('both mode still requires a forwarding destination', () => {
+    const app = new cdk.App();
+    expect(() => new EmailForwardingStack(app, 'TestStack', {
+      env: { account: '123456789012', region: 'us-east-1' },
+      domains: [{ domain: 'example.com', hostedZoneId: 'Z1', rules: [{ from: 'a@example.com' }] }],
+    })).toThrow(/to/);
+  });
+
+  test('default mode does not pass VerifyIdentityDomain (the stack creates the identity itself)', () => {
+    const template = synth({ enableSmtpSending: true });
+    const resources = Object.values(template.findResources('AWS::CloudFormation::CustomResource'));
+    expect(resources.length).toBeGreaterThanOrEqual(1);
+    for (const r of resources) {
+      expect(r.Properties.VerifyIdentityDomain).toBeUndefined();
+    }
+  });
+});
+
 describe('existingRuleSetName set', () => {
   const existing = { existingRuleSetName: 'sla-harness-ses-harness' };
 
