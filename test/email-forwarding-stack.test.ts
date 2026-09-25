@@ -292,6 +292,43 @@ describe('mode validation', () => {
   });
 });
 
+describe('two deployments in one account (configurable stack name)', () => {
+  test('all id-derived physical names separate between deployments', () => {
+    const app = new cdk.App();
+    const env = { account: '123456789012', region: 'us-east-1' };
+    const stackA = new EmailForwardingStack(app, 'EmailForwarding', {
+      env, ...baseProps, enableSmtpSending: true,
+    });
+    const stackB = new EmailForwardingStack(app, 'EmailForwardingAcme', {
+      env,
+      mode: 'send-only',
+      domains: [{ domain: 'acme.example', rules: [{ from: 'ops@acme.example' }] }],
+    });
+    const a = Template.fromStack(stackA);
+    const b = Template.fromStack(stackB);
+
+    const bucketNames = (t: Template) => Object.values(t.findResources('AWS::S3::Bucket'))
+      .map(r => r.Properties.BucketName);
+    expect(bucketNames(a)).toEqual(['emailforwarding-emails-123456789012']);
+    expect(bucketNames(b)).toEqual([]);
+
+    const userNames = (t: Template) => Object.values(t.findResources('AWS::IAM::User'))
+      .map(r => r.Properties.UserName).sort();
+    expect(userNames(a)).toEqual(['EmailForwarding-smtp-hello-example-com']);
+    expect(userNames(b)).toEqual(['EmailForwardingAcme-smtp-ops-acme-example']);
+
+    const secretNames = (t: Template) => Object.values(t.findResources('AWS::CloudFormation::CustomResource'))
+      .map(r => r.Properties.SecretName).sort();
+    expect(secretNames(a)).toEqual(['EmailForwarding/smtp/hello-example-com']);
+    expect(secretNames(b)).toEqual(['EmailForwardingAcme/smtp/ops-acme-example']);
+
+    const ruleSetNames = (t: Template) => Object.values(t.findResources('AWS::SES::ReceiptRuleSet'))
+      .map(r => r.Properties.RuleSetName);
+    expect(ruleSetNames(a)).toEqual(['EmailForwarding-rule-set']);
+    expect(ruleSetNames(b)).toEqual([]);
+  });
+});
+
 describe('existingRuleSetName set', () => {
   const existing = { existingRuleSetName: 'sla-harness-ses-harness' };
 
