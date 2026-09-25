@@ -72,6 +72,7 @@ Edit `config.json`:
 | `existingRuleSetName` | No | Name of an SES receipt rule set that already exists in the account/region. When set, the stack adds its forwarding rules to that rule set instead of creating a new one. See [Activating the Rule Set](#activating-the-rule-set). |
 | `domains` | Yes* | Multi-domain alternative to `domain`/`hostedZoneId`/`rules`/`existingTxtValues`. See [Multiple Domains](#multiple-domains). |
 | `mode` | No | `"both"` (default), `"send-only"`, or `"receive-only"`. See [Send-Only Mode](#send-only-mode-split-accounts). |
+| `stackName` | No | CloudFormation stack name (default `EmailForwarding`). Required to run more than one deployment in an account — see [Multiple Deployments in One Account](#multiple-deployments-in-one-account). |
 
 \* Provide either the single-domain fields (`domain`, `hostedZoneId`, `rules`) **or** a `domains` list — not both. In `send-only` mode, `hostedZoneId` and each rule's `to` are omitted.
 
@@ -169,6 +170,27 @@ When DNS lives in one account and SES production access in another, split the de
 **The domain identity must already exist and be verified in the send-only account** (this stack didn't create it there — verify the domain in the SES console or via DKIM records first). The deploy checks this and fails with a clear message rather than minting credentials that authenticate fine and then fail at send time.
 
 In the DNS-owning account, deploy the receiving half with `mode: "receive-only"` (equivalent to `enableSmtpSending: false`, just explicit). The default `mode: "both"` is unchanged behavior for existing deployments.
+
+## Multiple Deployments in One Account
+
+The stack name defaults to `EmailForwarding`. **Two configs pointed at the same account with the same stack name are not two deployments — the second deploy *updates* the first stack and removes every domain not in the new config**, taking its forwarding rules, IAM users, and SMTP secrets with it. CloudFormation reports this as an ordinary successful update; the first symptom is mail that stops arriving and Gmail entries that stop authenticating.
+
+To run a second, independent deployment in an account that already has one, give it its own name:
+
+```json
+{
+  "stackName": "EmailForwardingAcme",
+  "mode": "send-only",
+  "region": "us-east-1",
+  "domains": [ ... ]
+}
+```
+
+Each deployment then has its own lifecycle — destroying one cannot touch the other — and all named resources (IAM users `<stackName>-smtp-*`, secrets `<stackName>/smtp/*`, the bucket and rule set) separate automatically.
+
+**Rule-set ownership:** SES still allows only one *active* receipt rule set per account per region, so two `both`-mode deployments would compete for it — exactly one deployment should own the rule set and the others should adopt it via `existingRuleSetName`. A `send-only` second deployment (the split-account case this exists for) avoids the question entirely: it creates no rule set, bucket, or DNS.
+
+Don't rename an existing deployment's `stackName`: CloudFormation treats that as delete-and-recreate, which loses the IAM users and rotates every SMTP credential.
 
 ## Gmail "Send mail as" Setup
 
