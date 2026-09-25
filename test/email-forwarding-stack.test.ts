@@ -2,7 +2,7 @@ import * as cdk from 'aws-cdk-lib';
 import { Template } from 'aws-cdk-lib/assertions';
 import { EmailForwardingStack, EmailForwardingStackProps } from '../lib/email-forwarding-stack';
 
-const baseProps: Omit<EmailForwardingStackProps, 'env'> = {
+const baseProps = {
   domain: 'example.com',
   hostedZoneId: 'Z0123456789ABCDEF',
   rules: [{ from: 'hello@example.com', to: 'me@gmail.com' }],
@@ -50,6 +50,132 @@ describe('lambda runtime', () => {
       // nodejs20.x and earlier are at/past Lambda deprecation
       const major = Number(runtime.match(/^nodejs(\d+)\.x$/)?.[1]);
       expect(major).toBeGreaterThanOrEqual(22);
+    }
+  });
+});
+
+const twoDomains = {
+  domains: [
+    {
+      domain: 'example.com',
+      hostedZoneId: 'Z0123456789ABCDEF',
+      rules: [{ from: 'hello@example.com', to: 'me@gmail.com' }],
+    },
+    {
+      domain: 'example.org',
+      hostedZoneId: 'ZFEDCBA9876543210',
+      rules: [{ from: 'hello@example.org', to: 'me@gmail.com' }],
+    },
+  ],
+};
+
+function synthDomains(extraProps: Partial<EmailForwardingStackProps> = {}): Template {
+  const app = new cdk.App();
+  const stack = new EmailForwardingStack(app, 'TestStack', {
+    env: { account: '123456789012', region: 'us-east-1' },
+    ...twoDomains,
+    ...extraProps,
+  });
+  return Template.fromStack(stack);
+}
+
+describe('multi-domain (domains[])', () => {
+  test('legacy single-domain props and a one-element domains list synthesize identical templates', () => {
+    const legacyApp = new cdk.App();
+    const legacy = Template.fromStack(new EmailForwardingStack(legacyApp, 'TestStack', {
+      env: { account: '123456789012', region: 'us-east-1' },
+      ...baseProps,
+      enableSmtpSending: true,
+    }));
+    const newApp = new cdk.App();
+    const modern = Template.fromStack(new EmailForwardingStack(newApp, 'TestStack', {
+      env: { account: '123456789012', region: 'us-east-1' },
+      domains: [{ ...baseProps }],
+      enableSmtpSending: true,
+    }));
+    expect(modern.toJSON()).toEqual(legacy.toJSON());
+  });
+
+  test('each domain gets its own SES identity, MX, SPF, and DMARC records', () => {
+    const template = synthDomains();
+    template.resourceCountIs('AWS::SES::EmailIdentity', 2);
+    const records = template.findResources('AWS::Route53::RecordSet');
+    const byType = (t: string) => Object.values(records).filter(r => r.Properties.Type === t);
+    expect(byType('MX').map(r => r.Properties.Name).sort()).toEqual(['example.com.', 'example.org.']);
+    const txtNames = byType('TXT').map(r => r.Properties.Name).sort();
+    expect(txtNames).toEqual(['_dmarc.example.com.', '_dmarc.example.org.', 'example.com.', 'example.org.']);
+  });
+
+  test('one rule set holds one receipt rule per domain, deterministically ordered', () => {
+    const template = synthDomains();
+    template.resourceCountIs('AWS::SES::ReceiptRuleSet', 1);
+    const rules = Object.entries(template.findResources('AWS::SES::ReceiptRule'));
+    expect(rules).toHaveLength(2);
+    const recipients = rules.map(([, r]) => r.Properties.Rule.Recipients).sort();
+    expect(recipients).toEqual([['hello@example.com'], ['hello@example.org']]);
+    // second rule is chained after the first so ordering within the set is deterministic
+    const withAfter = rules.filter(([, r]) => r.Properties.After !== undefined);
+    expect(withAfter).toHaveLength(1);
+  });
+
+  test('shares one bucket and one forwarder covering all domains', () => {
+    const template = synthDomains();
+    template.resourceCountIs('AWS::S3::Bucket', 1);
+    const functions = Object.values(template.findResources('AWS::Lambda::Function'));
+    const forwarders = functions.filter(f => f.Properties.Environment?.Variables?.FORWARD_MAPPING);
+    expect(forwarders).toHaveLength(1);
+    const mapping = JSON.parse(forwarders[0].Properties.Environment.Variables.FORWARD_MAPPING);
+    expect(mapping).toEqual({
+      'hello@example.com': 'me@gmail.com',
+      'hello@example.org': 'me@gmail.com',
+    });
+  });
+
+  test('SMTP users are isolated per address and scoped to their own domain identity', () => {
+    const template = synthDomains({ enableSmtpSending: true });
+    const policies = Object.values(template.findResources('AWS::IAM::Policy'));
+    const sendPolicies = policies.filter(p =>
+      p.Properties.Users !== undefined &&
+      JSON.stringify(p.Properties.PolicyDocument).includes('ses:SendRawEmail'));
+    expect(sendPolicies).toHaveLength(2);
+    const scopes = sendPolicies.map(p => {
+      const stmt = p.Properties.PolicyDocument.Statement[0];
+      return {
+        resource: stmt.Resource,
+        from: stmt.Condition.StringEquals['ses:FromAddress'],
+      };
+    });
+    expect(scopes).toContainEqual({
+      resource: 'arn:aws:ses:us-east-1:123456789012:identity/example.com',
+      from: 'hello@example.com',
+    });
+    expect(scopes).toContainEqual({
+      resource: 'arn:aws:ses:us-east-1:123456789012:identity/example.org',
+      from: 'hello@example.org',
+    });
+  });
+
+  test('multi-domain works with existingRuleSetName: every rule targets the adopted set', () => {
+    const template = synthDomains({ existingRuleSetName: 'already-active-set' });
+    template.resourceCountIs('AWS::SES::ReceiptRuleSet', 0);
+    const rules = Object.values(template.findResources('AWS::SES::ReceiptRule'));
+    expect(rules).toHaveLength(2);
+    for (const rule of rules) {
+      expect(rule.Properties.RuleSetName).toBe('already-active-set');
+    }
+  });
+
+  test('first domain keeps the legacy construct IDs so existing deployments upgrade without churn', () => {
+    const legacyApp = new cdk.App();
+    const legacy = Template.fromStack(new EmailForwardingStack(legacyApp, 'TestStack', {
+      env: { account: '123456789012', region: 'us-east-1' },
+      ...baseProps,
+    }));
+    const multi = synthDomains();
+    const legacyIds = Object.keys(legacy.toJSON().Resources);
+    const multiIds = Object.keys(multi.toJSON().Resources);
+    for (const id of legacyIds) {
+      expect(multiIds).toContain(id);
     }
   });
 });
