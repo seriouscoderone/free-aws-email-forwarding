@@ -71,8 +71,9 @@ Edit `config.json`:
 | `existingTxtValues` | No | Existing TXT record values at the domain apex to preserve (e.g. `["google-site-verification=abc123"]`) |
 | `existingRuleSetName` | No | Name of an SES receipt rule set that already exists in the account/region. When set, the stack adds its forwarding rules to that rule set instead of creating a new one. See [Activating the Rule Set](#activating-the-rule-set). |
 | `domains` | Yes* | Multi-domain alternative to `domain`/`hostedZoneId`/`rules`/`existingTxtValues`. See [Multiple Domains](#multiple-domains). |
+| `mode` | No | `"both"` (default), `"send-only"`, or `"receive-only"`. See [Send-Only Mode](#send-only-mode-split-accounts). |
 
-\* Provide either the single-domain fields (`domain`, `hostedZoneId`, `rules`) **or** a `domains` list — not both.
+\* Provide either the single-domain fields (`domain`, `hostedZoneId`, `rules`) **or** a `domains` list — not both. In `send-only` mode, `hostedZoneId` and each rule's `to` are omitted.
 
 ## Multiple Domains
 
@@ -143,6 +144,31 @@ With this set, the stack:
 **Rule ordering caveat:** SES evaluates rules within a set **in order**, and a broad rule (e.g. a catch-all for your domain) can shadow a later, more specific rule. The stack's rule is appended to the end of the adopted set. If the existing set contains a catch-all matching your forwarding addresses, reorder the rules in the SES console (or with `aws ses reorder-receipt-rule-set`) so the forwarding rule comes first — otherwise it may never fire.
 
 Alternatively, if the existing rules are simple forwards for another domain, you can add them all to this stack's config so everything runs through one rule set.
+
+## Send-Only Mode (Split Accounts)
+
+The two halves of this stack have different constraints, and they do not always point at the same AWS account:
+
+- **Receiving must run where the Route53 hosted zone is** — the stack writes MX, SPF, and DKIM records into the zone, and it cannot write to a zone owned by another account.
+- **Sending must run where SES has production access** — in the SES sandbox, SMTP credentials produce a Gmail "Send mail as" entry that appears to work and then cannot reach ordinary recipients.
+
+When DNS lives in one account and SES production access in another, split the deployment:
+
+```json
+{
+  "mode": "send-only",
+  "region": "us-east-1",
+  "domains": [
+    { "domain": "yourdomain.com", "rules": [{ "from": "hello@yourdomain.com" }] }
+  ]
+}
+```
+
+`mode: "send-only"` provisions **only** the per-address IAM users, access keys, and SMTP secrets — no S3 bucket, no Lambda, no receipt rule or rule set, no identity, no DNS records. `hostedZoneId` and each rule's `to` are omitted, since nothing is received. `region` must be the region where the domain identity is verified — the SMTP endpoint and password derivation are both region-specific.
+
+**The domain identity must already exist and be verified in the send-only account** (this stack didn't create it there — verify the domain in the SES console or via DKIM records first). The deploy checks this and fails with a clear message rather than minting credentials that authenticate fine and then fail at send time.
+
+In the DNS-owning account, deploy the receiving half with `mode: "receive-only"` (equivalent to `enableSmtpSending: false`, just explicit). The default `mode: "both"` is unchanged behavior for existing deployments.
 
 ## Gmail "Send mail as" Setup
 
